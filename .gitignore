@@ -1,0 +1,20 @@
+# secrets / local env
+.env
+.env.local
+.env.test
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# vercel
+.vercel/
+
+# os
+.DS_Store
