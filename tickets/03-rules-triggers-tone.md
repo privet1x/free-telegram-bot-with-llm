@@ -1,263 +1,263 @@
-# TICKET-03 — Детерминированные rules/lists, auto-trigger и управление тоном
+# TICKET-03 — Deterministic Rules, Lists, Automatic Triggers, and Tone Control
 
-**Размер:** L · **Зависит от:** 02 · **Разблокирует:** 04
-**Общий контракт:** `00-ARCHITECTURE.md` (§4 и §6)
+**Size:** L · **Depends on:** 02 · **Unblocks:** 04
+**Shared contract:** 00-ARCHITECTURE.md sections 4 and 6
 
-## Цель
+**Status:** Local implementation and automated checks are complete. Live
+provider/Vercel acceptance remains pending authorized deployment.
 
-Сделать поведение бота управляемым данными: встроенные/кастомный тон,
-персональные политики через списки, текстовые правила и автоматическое
-вмешательство без mention. Этот тикет реализует prompt-слои **1–4**. Слой 5
-`/judge` остаётся Ticket 04.
+## Goal
 
-Главный E2E этого тикета — обычное «это бред» без упоминания действительно
-доходит до processor. Поэтому matching/routing добавляется в webhook, а не
-только в worker, который никогда бы не получил такое сообщение.
+Make bot behaviour data-driven: built-in and custom tone, personal policies
+through lists, text rules, and automatic intervention without a bot mention.
+This ticket implements prompt layers 1–4. The judge-specific layer remains in
+Ticket 04.
 
-## Канонические модели
+The core end-to-end proof is that an ordinary message containing a configured
+keyword, without a mention, reaches the processor. Matching and routing must
+therefore occur in the webhook, not only in a worker that never receives that
+message.
 
-### Tone config
+## Canonical models
 
-```json
+### Tone configuration
+
+~~~json
 {
   "tone_mode": "preset",
   "tone_preset": "neutral",
   "custom_system_prompt": null,
   "judge_default_n": 20
 }
-```
+~~~
 
-- `tone_mode`: `preset` или `custom`.
-- Встроенные canonical slug: `neutral`, `serious`, `scientist`, `street`,
-  `sarcastic_robot`. Обязательные PRD presets — neutral/scientist/street/
-  sarcastic robot; `serious` — сдержанный пресет для прямо указанной в
-  PRD команды `/set_mode serious`.
-- В `custom` mode непустой `custom_system_prompt` заменяет base preset; в
-  `preset` mode кастомный текст хранится, но не активен.
-- Chat config `cfg:{TELEGRAM_ALLOWED_CHAT_ID}` перекрывает `cfg:global` по
-  отдельным полям; неизвестные/пустые значения fail validation, а не создают
-  новый неявный preset.
+- tone_mode is preset or custom.
+- Canonical built-in presets are neutral, serious, scientist, street, and
+  sarcastic_robot. Serious exists specifically for the required
+  /set_mode serious command.
+- In custom mode, a non-empty custom_system_prompt replaces base preset text.
+  In preset mode, custom text remains saved but inactive.
+- cfg:<allowed_chat_id> overrides cfg:global field by field. Empty or unknown
+  values fail validation rather than creating a hidden preset.
 
-### Персональные списки
+### Personal lists
 
-```json
+~~~json
 {
   "slug": "aggressive",
-  "title": "Агрессивный ответ",
+  "title": "Sarcastic response",
   "enabled": true,
   "priority": 50,
   "applies_to": ["explicit", "auto", "judge"],
-  "injected_prompt": "Отвечай этому пользователю саркастично, без оскорблений."
+  "injected_prompt": "Use dry sarcasm without personal attacks."
 }
-```
+~~~
 
-- Membership всегда numeric Telegram `user_id`.
-- Персональное поведение выражается списком + `injected_prompt`; отдельного
-  `rule.kind=personal` нет.
-- Reserved slug `ignore` нельзя удалить/переименовать. Он не инжектит prompt и
-  подавляет только автоматические ответы; явный mention/reply доступен.
+- Membership always uses numeric Telegram user_id.
+- A personal policy is expressed by a list plus injected_prompt. There is no
+  separate rule.kind="personal".
+- The reserved ignore list cannot be removed or renamed. It injects no prompt and
+  suppresses only automatic replies; explicit mention/reply remains available.
 
-### Текстовые правила
+### Text rules
 
-```json
+~~~json
 {
-  "id": "bred",
+  "id": "nonsense",
   "enabled": true,
   "priority": 50,
   "scope": "all",
-  "match": {"type": "substring", "value": "бред"},
-  "instruction": "Аргументированно объясни, почему обсуждаемое не является бредом.",
+  "match": {"type": "substring", "value": "nonsense"},
+  "instruction": "Explain calmly why the argument is not nonsense.",
   "stop_processing": false
 }
-```
+~~~
 
-- `scope`: `auto`, `explicit`, `judge`, `all`. `auto`/`all` может создать job без mention;
-  `explicit`/`all` добавляет policy к явному Flash request, `judge`/`all` — к
-  judge snapshot Ticket 04.
-- `match.type`: `substring`, `word`, `phrase`. Regex вне MVP.
-- Нормализация для matching: NFKC → casefold → punctuation/whitespace
-  normalization. `word` сравнивает полный Unicode-токен; `phrase` сохраняет
-  границы нормализованных слов; `substring` предназначен для корня.
-- Валидация: непустой value/instruction, ограничение длины, `priority` в
-  `[-1000,1000]`, безопасные ID/slug. Исходный текст не модифицируется для LLM.
+- scope is auto, explicit, judge, or all. auto/all may create an unmentioned
+  job; explicit/all add policy to explicit Flash work; judge/all are snapshotted
+  by Ticket 04.
+- Match types are substring, word, and phrase. Regex is out of scope.
+- Normalize for matching as NFKC, casefold, and punctuation/whitespace
+  normalization. A word matches a full Unicode token; phrase preserves normalized
+  word boundaries; substring is intentionally appropriate for word roots.
+- Require non-empty match value and instruction, bounded lengths, priority in
+  [-1000,1000], and safe IDs/slugs. Never mutate original text sent to the LLM.
 
-## Детерминированность и конфликты
+## Determinism and conflicts
 
-1. Совпавшие rules сортируются `priority DESC, id ASC`.
-2. Rules обрабатываются группами одинакового priority в порядке `id ASC`.
-   Включается вся текущая группа; если хотя бы у одного её rule
-   `stop_processing=true`, все группы с меньшим priority отбрасываются.
-3. Активные member-lists сортируются `priority DESC, slug ASC`.
-4. Сначала base tone, затем проверенные numeric actor ID/admin status, затем list
-   policies и matched rules. Telegram name/username и сырые сообщения идут
-   последним недоверенным data-блоком.
-5. На один job действует максимум 10 list policies и 10 rule policies после
-   сортировки; превышение логируется метрикой и не раздувает prompt бесконечно.
-6. Для стабильности enqueue сохраняет в `request_json.effective_policy` уже
-   выбранные tone text, вычисленный `is_admin`, list policies и matched rule
-   snapshots. Изменение Redis после enqueue влияет на следующие, не текущий job.
+1. Sort matched rules by priority DESC, id ASC.
+2. Process rules in equal-priority groups, each in id ASC. Include the complete
+   current group; if any member has stop_processing=true, discard all
+   lower-priority groups.
+3. Sort active member lists by priority DESC, slug ASC.
+4. Apply base tone, trusted numeric actor ID and computed admin state, list
+   policies, then matched rules. Telegram name/username and raw messages appear
+   only in the final untrusted data block.
+5. Cap one job at 10 list policies and 10 rule policies after sorting. Record a
+   metric when the cap is exceeded; never create unbounded prompt growth.
+6. At enqueue, save effective_policy: selected tone text, computed is_admin, list
+   policies, and rule snapshots. Later Redis changes affect later jobs only.
 
-## Объём работ
+## Scope
 
-### 1. Stores и validation
+### 1. Stores and validation
 
-- [ ] `app/store/config_store.py`: merge global/chat config, get/set
-  `tone_mode`, preset, custom prompt; optimistic/atomic update, schema validation.
-  Mutation явно выбирает `scope="global"` (`cfg:global`) или `scope="chat"`
-  (`cfg:{allowed_chat_id}`); есть atomic clear chat override, а read возвращает global,
-  override и effective config.
-- [ ] `app/store/lists.py`: CRUD meta/membership, `member_lists(user_id, kind)`,
-  deterministic sort, reserved `ignore`; не оставлять orphan keys/index entries.
-- [ ] `app/store/rules.py`: CRUD, normalization/matching, deterministic resolution,
-  scope filter; не оставлять orphan keys/index entries.
-- [ ] Расширить/проверить `app/store/admins.py` из Ticket 02: list/add/remove;
-  super-admin из env всегда true и не может быть удалён.
-- [ ] Ограничить admin-authored prompt/instruction по размеру и показывать в
-  API validation error конкретное поле.
+- [ ] Add app/store/config_store.py with global/chat merge, get/set for tone
+  mode, preset, custom prompt, atomic/optimistic validation, and atomic chat
+  override clear. A mutation must explicitly choose scope="global" or
+  scope="chat"; reads return global, override, and effective config.
+- [ ] Add app/store/lists.py for list metadata and membership CRUD,
+  member_lists(user_id, kind), deterministic sort, and reserved ignore handling.
+  Do not leave orphan keys or index members.
+- [ ] Add app/store/rules.py for CRUD, normalization/matching, deterministic
+  resolution, and scope filtering. Do not leave orphan keys or index members.
+- [ ] Extend the Ticket 02 admin store with list/add/remove. SUPER_ADMIN_ID is
+  always admin and cannot be removed.
+- [ ] Bound administrator-authored prompts/instructions and return a field-level
+  validation error when input is invalid.
 
-### 2. Webhook routing — обязательное расширение
+### 2. Required webhook routing extension
 
-После Ticket 02 routing меняется так:
+After Ticket 02, routing becomes:
 
-1. После secret/allowed-chat gate `edited_message` только upsert-ится и не
-   запускает command/explicit/auto routing второй раз.
-2. Для нового message сначала распознать route и зафиксировать pre-trigger
-   snapshot durable helper-ом Ticket 02; command text не участвует в auto rules.
-3. Для явного mention/reply сопоставить rules `explicit|all`, собрать
-   `effective_policy`, создать обычный reply job. `ignore` и auto cooldown его
-   не подавляют.
-4. Для обычного text сопоставить rules `auto|all`. Если совпадений нет — только
-   history. Если автор в `ignore` — только history.
-5. До нового matching сначала загрузить `job:{update_id}`: существующий
-   `received` auto job всегда продолжает history/publish и не подавляется чужим
-   cooldown либо новой конфигурацией.
-6. Для нового auto route одной Lua/CAS-операцией проверить отсутствие cooldown,
-   записать owner value `{update_id}:{random_token}` с EX и создать durable
-   `received` job со snapshot. Нельзя оставлять crash window «cooldown есть, job
-   ещё нет».
-7. Затем upsert current history/user и publish по QStash dedup ID. Известная
-   publish failure **не** снимает cooldown: `received` job остаётся его owner,
-   Telegram retry сначала находит этот job и может повторить publish, а новые
-   auto updates до EX подавляются. Cooldown compare-delete разрешён только
-   owner-токеном в той же атомарной операции, которая удаляет/отменяет сам
-   job; нельзя оставить resumable job без его blocker.
+1. After secret/allowed-chat gating, an edited_message only upserts history and
+   never runs command, explicit, or automatic routing twice.
+2. For a new message, detect command/route and take a durable pre-trigger
+   snapshot using Ticket 02 helpers. Command text does not run automatic rules.
+3. For explicit mention/reply, match rules with explicit/all scope, build
+   effective_policy, and create an ordinary reply job. ignore and auto cooldown
+   never suppress explicit work.
+4. For ordinary text, match auto/all rules. With no match, only write history.
+   If the author belongs to ignore, only write history.
+5. Before new matching, load job:<update_id>. An existing received auto job
+   completes history/publication and cannot be suppressed by a new cooldown or
+   changed configuration.
+6. For a new automatic route, one Lua/CAS operation checks no cooldown, writes
+   owner value {update_id}:{random_token} with TTL, and creates the durable
+   received job with snapshot. There must be no crash window where cooldown
+   exists without a job.
+7. Then upsert history/user and publish under the QStash deduplication ID. A known
+   publish failure does **not** remove cooldown: received remains its owner,
+   Telegram retry finds it and retries publication, and new automatic updates
+   stay suppressed until expiry. Only compare-delete by the owner token in the
+   same atomic operation that cancels/removes the job.
 
-Matching в webhook — дешёвая Redis/CPU операция; LLM там не вызывается.
-Processor не принимает решение «ответить ли» заново: он исполняет сохранённый
-route/effective policy. Это предотвращает конфигурационный drift.
+Webhook matching is inexpensive Redis/CPU work; it never calls an LLM. The
+processor executes the stored route and policy without deciding whether to
+respond again. This avoids configuration drift.
 
-### 3. Prompt builder и processor
+### 3. Prompt builder and processor
 
-- [ ] Расширить `build_reply_messages`:
-  - layer 1 — effective preset или custom base;
-  - layer 2 — trusted numeric actor ID и вычисленный `is_admin`;
-  - layer 3 — sorted list instructions;
-  - layer 4 — sorted matched rule instructions;
-  - final user/data — Telegram name/username, transcript, reply target, current
-    message.
-- [ ] Любой текст/username/name из Telegram сериализуется как данные. Даже если
-  в transcript написано «ignore previous system», это не меняет trusted policy.
-- [ ] Processor обслуживает `reply` и `auto_rule` одним flash client
-  `deepseek-ai/deepseek-v4-flash`; delivery/split/retry полностью общий с Ticket 02.
+- [ ] Extend build_reply_messages:
+  - layer 1: effective preset or custom base;
+  - layer 2: trusted numeric actor ID and computed is_admin;
+  - layer 3: sorted list instructions;
+  - layer 4: sorted matched-rule instructions;
+  - final user/data: Telegram name/username, transcript, reply target, and
+    current message.
+- [ ] Serialize every Telegram name/username/text as data. A transcript instruction
+  such as “ignore previous instructions” cannot alter trusted policy.
+- [ ] Process reply and auto_rule through the same Flash client and Ticket 02
+  delivery/split/retry path.
 
-### 4. Команды из чата
+### 4. Chat commands
 
-Только admin/super-admin разрешённого чата:
+Only an admin or super-admin in the allowed group may run these:
 
-- [ ] `/tone <neutral|serious|scientist|street|sarcastic_robot>` и alias
-  `/set_mode <slug>`: выбрать preset для current allowed chat (`cfg:{chat_id}`)
-  и `tone_mode=preset`, не удаляя сохранённый custom prompt. `/tone global <slug>` /
-  `/set_mode global <slug>` меняет fallback `cfg:global`; `/tone clear` удаляет
-  chat override и возвращается к global.
-- [ ] Ergonomic value alias `sarcastic` канонизируется в
-  `sarcastic_robot`; `/tone sarcastic` и `/set_mode serious` из PRD оба
-  работают. Config/API хранят только canonical slug.
-- [ ] `/mode`: показать active mode/preset и разрешённые slug.
-- [ ] Команды с `@suffix` исполняются только при suffix текущего бота.
-- [ ] Не-админ получает короткий отказ; invalid slug — usage + список slug.
-- [ ] Command path идемпотентен: после history/user upsert одна Lua/CAS
-  операция create-if-absent пишет `cmd:{update_id}` с TTL 30 дней,
-  применяет typed canonical config value и ставит финальный
-  `dedup:update:*`. Только winner возвращает короткий Telegram webhook reply;
-  retry по existing command receipt не меняет config и отвечает `200` без второго
-  reply. Crash до atomic operation не меняет ничего; crash после неё не
-  повторяет mutation. Это также не даёт старому Telegram retry откатить
-  более новую UI/chat настройку.
-- [ ] Telegram webhook reply не возвращает Bot API `message_id`, поэтому он
-  честно не добавляется в canonical history. В history попадают только
-  outbound `sendMessage`/`editMessageText` с реальным result ID.
+- [ ] /tone <neutral|serious|scientist|street|sarcastic_robot> and
+  /set_mode <slug> select a preset for the current allowed chat and set
+  tone_mode=preset without deleting saved custom text.
+- [ ] /tone global <slug> and /set_mode global <slug> update cfg:global.
+  /tone clear removes the chat override and returns to global configuration.
+- [ ] The ergonomic command alias sarcastic canonicalises to sarcastic_robot.
+  Thus /tone sarcastic and /set_mode serious both work, while config/API store
+  canonical values only.
+- [ ] /mode reports active mode/preset and permitted slugs.
+- [ ] A command suffix executes only when it identifies this bot.
+- [ ] Non-admin gets a short refusal; invalid slug gets usage plus allowed slugs.
+- [ ] The command path is idempotent. After user/history upsert, one Lua/CAS
+  create-if-absent operation writes cmd:<update_id> for 30 days, applies a typed
+  canonical configuration value, and writes final dedup:update. Only the winner
+  returns a short webhook reply. A retry with a command receipt changes nothing
+  and sends no second reply. A crash before the operation changes nothing; a
+  crash after it cannot roll back a newer UI/chat setting.
+- [ ] A Telegram webhook-body reply has no Bot API message_id, so it is not added
+  to canonical history. History contains only outbound sendMessage or
+  editMessageText results with a real ID.
 
-### 5. Runtime config
+### 5. Runtime configuration
 
-- [ ] Settings/`.env.example` добавляют `AUTO_TRIGGER_COOLDOWN_SECONDS` и bounded
-  `MAX_LIST_POLICIES=10`/`MAX_RULE_POLICIES=10`; production validation требует
-  positive cooldown и current Ticket-02 queue dependencies. Health не считается ready,
-  если auto routing включён, а queue/config dependency отсутствует.
+- [ ] Add AUTO_TRIGGER_COOLDOWN_SECONDS plus
+  MAX_LIST_POLICIES=10/MAX_RULE_POLICIES=10 to settings and .env.example.
+  Production validation requires positive limits and the Ticket 02 queue
+  dependencies when automatic routing is enabled. Health is not ready if auto
+  routing is enabled without its queue/config dependency.
 
-### 6. Seed
+### 6. Seed data
 
-- [ ] `scripts/seed.py` идемпотентно создаёт reserved `ignore`, demo list
-  `aggressive` и demo rule `bred` со `scope="all"`, но не перезаписывает
-  изменённые админом сущности без явного `--force`.
-- [ ] Скрипт принимает только разрешённый chat config, возвращает non-zero при
-  Redis/API ошибке и не печатает секреты.
+- [ ] Add an idempotent scripts/seed.py that creates reserved ignore, a demo
+  aggressive list, and demo rule nonsense with scope="all". It never overwrites
+  administrator changes without explicit --force.
+- [ ] The script operates only on the configured allowed-chat context, returns
+  non-zero on Redis/API failure, and never prints secrets.
 
-## Ошибки и лимиты
+## Failure and limit policy
 
-- Неуспешный rules/config read для потенциального auto-trigger не означает
-  «молча не отвечать»: webhook возвращает retryable error до успешного enqueue.
-- Cooldown применяется только к auto-trigger и атомарно создаётся вместе с job
-  до publish. Publish failure оставляет и resumable job, и его blocker до EX;
-  только retry именно этого update обходит свой cooldown. Suppressed update всё
-  равно получает history + final dedup marker.
-- Rule/list policy из Redis считается trusted только потому, что её API будет
-  admin-only; до Ticket 05 изменения доступны лишь seed/manual operations.
-- Слишком много совпадений не меняет сортировку; применяется документированный
-  cap, а не случайный порядок Redis SET.
+- Failure to load rules/config for a potential automatic trigger is retryable,
+  not a silent “do nothing.”
+- Cooldown applies only to automatic work and is atomically created with the job
+  before publication. Publication failure retains both resumable job and blocker
+  until expiry. Only a retry of that same update bypasses its owner cooldown.
+  A suppressed update still writes history and final dedup.
+- Rule/list policy is trusted only because mutation will be admin-only. Before
+  Ticket 05, change it only through seed/manual operations.
+- Too many matches still use the documented deterministic cap, never Redis's
+  arbitrary set order.
 
-## Вне объёма
+## Out of scope
 
-- Judge-layer, grounded facts и pro — Ticket 04.
-- Web CRUD/UI и username resolution — Ticket 05.
+- Judge layer, grounded facts, and Pro: Ticket 04.
+- Web CRUD/UI and username resolution UI: Ticket 05.
 
-## Автоматические проверки
+## Automated checks
 
-- [ ] Все match types, Unicode/NFKC/casefold, punctuation и false positives.
-- [ ] Deterministic rule/list ordering, equal priorities, stop processing, cap.
-- [ ] Scope matrix (`auto|explicit|judge|all`), ignore semantics и admin status layer.
-- [ ] Unmentioned auto message создаёт job; no-match не создаёт; command не
-  запускает rule; mention получает explicit/all rules; edit не создаёт job.
-- [ ] Auto cooldown parallel race, crash между gate/job (atomic invariant),
-  publish failure сохраняет owner blocker, retry существующего `received`
-  job обходит его, а новый update при чужом token подавляется.
+- [ ] All match types, Unicode NFKC/casefold, punctuation, and false positives.
+- [ ] Deterministic rule/list ordering, equal priorities, stop processing, and
+  policy caps.
+- [ ] Scope matrix auto/explicit/judge/all, ignore semantics, and trusted admin
+  status.
+- [ ] Unmentioned automatic message creates a job; no-match does not; command
+  never starts a rule; mention receives explicit/all policy; edit creates no job.
+- [ ] Parallel automatic cooldown race, atomic gate/job invariant, publication
+  failure retains owner blocker, received-job retry bypasses it, and a different
+  update is suppressed.
 - [ ] Tone commands: admin/non-admin, foreign suffix, invalid slug,
-  `sarcastic→sarcastic_robot`, canonical `serious`, parallel duplicate and
-  crash before/after atomic config+command-receipt+dedup, chat/global/clear scope,
-  custom text сохраняется при переключении preset.
-- [ ] Prompt-role snapshot: raw transcript отсутствует в system content.
-- [ ] Ticket 01–02 tests, `ruff`, CI Python 3.12 остаются зелёными.
+  sarcastic→sarcastic_robot, serious, duplicate/concurrent calls, crash
+  boundaries, global/chat/clear scope, and retained custom text.
+- [ ] Prompt-role snapshot proves raw transcript is absent from system content.
+- [ ] Ticket 01–02 tests, Ruff, and Python 3.12 CI stay green.
 
-## Критерии приёмки (live E2E)
+## Live E2E acceptance
 
-1. Любой не-ignored user пишет «это полный бред» **без mention** — webhook ставит
-   `auto_rule` job, бот отвечает с rule instruction.
-2. Два rules одинакового priority дают один и тот же порядок на повторных тестах;
-   `stop_processing` отсекает только ожидаемые rules.
-3. Участник `aggressive` получает его policy, другой участник — нет. Участник
-   `ignore` не вызывает auto rule, но получает ответ на явный `@bot`.
-4. Admin выполняет `/tone scientist`, `/tone sarcastic`, `/set_mode serious`,
-   затем `/tone global street` и `/tone clear`; aliases канонизируются, current/global
-   precedence видна, config сохраняет valid slug и стиль меняется.
-5. Не-admin не меняет тон. В prompt contract присутствует вычисленный admin
-   status, а raw chat остаётся в user/data role.
-6. Серия auto-trigger сообщений даёт не более одного job за cooldown window;
-   явный mention в этот момент всё равно обслуживается.
+1. A non-ignored user writes “this is nonsense” without a mention. Webhook creates
+   an auto_rule job and the bot replies with the rule instruction.
+2. Two equal-priority rules produce the same order on repeated tests, and
+   stop_processing discards exactly the expected lower-priority rules.
+3. A member of aggressive gets its policy; another user does not. A member of
+   ignore gets no automatic response but can still receive an explicit @bot reply.
+4. An admin runs /tone scientist, /tone sarcastic, /set_mode serious,
+   /tone global street, then /tone clear. Alias canonicalisation and
+   chat/global precedence are visible and durable.
+5. A non-admin cannot change tone. The prompt contract includes computed admin
+   state while raw chat remains user/data content.
+6. A burst of automatic matches produces at most one job per cooldown window,
+   while an explicit mention still receives a reply.
 
-## Риски
+## Risks
 
-- Автоответы расходуют NIM/QStash quota — cap/cooldown/ignore обязательны.
-- `substring` для корня сознательно даёт больше совпадений; UI должен объяснять
-  различие с `word`/`phrase`.
-- Admin-authored custom policy имеет высокий приоритет и потенциально опасна;
-  жёсткий лимит размера, typed validation, admin-only mutation и немедленный
-  session/role recheck обязательны в Ticket 05.
+- Automatic replies consume NIM/QStash quota, so cap/cooldown/ignore are required.
+- substring intentionally has broad root matching; the UI must explain its
+  difference from word and phrase.
+- Administrator-authored policy has high priority and can be dangerous. Bound its
+  size, validate types, limit mutation to admins, and recheck role/session
+  immediately in Ticket 05.
