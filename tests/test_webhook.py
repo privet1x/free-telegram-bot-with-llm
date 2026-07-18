@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import threading
 
-import pytest
-
 from app.settings import settings
 from app.store import history, users
 from app.store.dedup import already_seen
@@ -184,8 +182,8 @@ def test_history_failure_does_not_mark_update_complete(client, monkeypatch):
     monkeypatch.setattr(history, "upsert", fail_once)
     update = make_update(update_id=88, message_id=88, text="retry me")
 
-    with pytest.raises(RuntimeError, match="temporary Redis failure"):
-        post_webhook(client, update)
+    failed = post_webhook(client, update)
+    assert failed.status_code == 503
 
     assert already_seen(88) is False
     assert history.recent(100) == []

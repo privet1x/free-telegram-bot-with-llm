@@ -1,52 +1,58 @@
-# Тикеты — Telegram-бот с LLM и Web Admin
+# Tickets — Telegram Bot with an LLM Admin Panel
 
-План намеренно состоит из небольшого числа крупных E2E-тикетов. Общие
-инварианты, схема Redis, state machine, prompt roles, env и privacy contract
-находятся в [00-ARCHITECTURE.md](00-ARCHITECTURE.md).
+This intentionally small plan uses a few large end-to-end tickets. The shared
+invariants, Redis schema, state machine, prompt roles, environment variables,
+and privacy contract are in [00-ARCHITECTURE.md](00-ARCHITECTURE.md).
 
-## Порядок
+## Delivery order
 
-| # | Тикет | Результат | Зависит |
+| # | Ticket | Outcome | Depends on |
 |---|---|---|---|
-| 00 | [Архитектура](00-ARCHITECTURE.md) | Единый технический/данный контракт | — |
-| 01 | [Closed-chat ingestion](01-skeleton-webhook-history.md) | Vercel webhook, allowed chat, atomic history/edit upsert, observed users | — |
-| 02 | [Durable QStash + Flash](02-qstash-llm-reply.md) | Snapshot/job state machine, mention/reply через `deepseek-ai/deepseek-v4-flash` | 01 |
-| 03 | [Rules/lists/tone](03-rules-triggers-tone.md) | Детерминированные policies и unmentioned auto routing | 02 |
-| 04 | [Judge + grounded facts](04-dispute-resolution-judge.md) | Admin-only verdict через `deepseek-ai/deepseek-v4-pro` + Tavily citations | 03 |
-| 05 | [Web Admin](05-admin-panel.md) | Telegram OIDC, secure session, CRUD/UI и privacy purge | 04 |
+| 00 | [Architecture](00-ARCHITECTURE.md) | One technical and data contract | — |
+| 01 | [Closed-chat ingestion](01-skeleton-webhook-history.md) | Vercel webhook, allowed-chat gate, atomic history/edit upsert, observed users | — |
+| 02 | [Durable QStash + Flash](02-qstash-llm-reply.md) | Snapshot/job state machine and mention/reply via `deepseek-ai/deepseek-v4-flash` | 01 |
+| 03 | [Rules, lists, and tone](03-rules-triggers-tone.md) | Deterministic policies and unmentioned automatic routing | 02 |
+| 04 | [Judge and grounded facts](04-dispute-resolution-judge.md) | Admin-only verdict through `deepseek-ai/deepseek-v4-pro` and Tavily citations | 03 |
+| 05 | [Web admin](05-admin-panel.md) | Telegram OIDC, secure session, CRUD/UI, and privacy purge | 04 |
 
 ```text
 01 → 02 → 03 → 04 → 05
 ```
 
-## Неподвижные решения
+## Fixed decisions
 
-- Ровно один закрытый `TELEGRAM_ALLOWED_CHAT_ID`; чужие чаты не логируются.
-- Основные ответы: NVIDIA NIM `deepseek-ai/deepseek-v4-flash`.
-- `/judge` и явный admin-only `/deep`: NVIDIA NIM `deepseek-ai/deepseek-v4-pro`
-  с текущим проверенным hosted-NIM non-thinking payload.
-- Grounded fact-check: до 3 обезличенных Tavily basic searches; реальные sources
-  прикладываются к verdict, а при недоступности поиска facts честно помечаются
-  непроверенными.
-- QStash получает только job ID. Private history/context snapshot остаётся в
-  Redis; retries проходят через `received → enqueued → processing → delivered`
-  и terminal failure states.
-- История — максимум 30 записей, atomic upsert edits/outbound messages, sliding
-  retention и per-record cutoff 30 дней; queued job использует snapshot на
-  момент trigger, а privacy purge отменяет indexed jobs и удаляет их private
-  snapshots.
-- Web Admin использует современный Telegram OIDC Authorization Code + PKCE/state,
-  не legacy Login Widget.
-- Vercel worker `maxDuration` — 300 секунд; все Telegram LLM outputs plain text и
-  делятся общим splitter до 4000 символов.
+- The bot serves exactly one private `TELEGRAM_ALLOWED_CHAT_ID`; other chats are
+  acknowledged but never persisted.
+- Ordinary replies use NVIDIA NIM `deepseek-ai/deepseek-v4-flash`.
+- `/judge` and explicit admin-only `/deep` use
+  `deepseek-ai/deepseek-v4-pro` with the verified hosted-NIM non-thinking
+  payload.
+- Grounded fact checks use at most three de-identified Tavily basic searches.
+  Real sources are attached to a verdict; when search is unavailable, facts are
+  explicitly marked unverified.
+- QStash receives only a job ID. Private history and the context snapshot stay
+  in Redis. Retries follow a durable state machine with terminal failure states.
+- History contains at most 30 records, supports atomic edits and outbound
+  messages, uses a sliding retention TTL plus a per-record cutoff, and is
+  snapshotted at trigger time. Privacy purge cancels indexed jobs and deletes
+  their private snapshots.
+- The web admin uses Telegram OIDC Authorization Code Flow with PKCE/state, not
+  the legacy Login Widget.
+- Vercel workers have `maxDuration=300`; LLM output is plain text and is split
+  into chunks no longer than 4,000 Unicode characters.
 
-## Definition of done каждого тикета
+## Completion definition
 
-1. Реализованы все contracts/ошибки/retention/security из архитектуры.
-2. `ruff` и весь `pytest` suite зелёные в CI на Python 3.12; добавлены unit и
-   внешние contract tests нового звена.
-3. Пройдены live E2E criteria тикета на стабильном Vercel deployment с реальными
-   Telegram, Upstash и применимыми provider credentials.
-4. В репозитории нет секретов, а logs не содержат private transcript/prompts.
-5. README/env/deployment instructions обновлены вместе с поведением; privacy
-   notice опубликован до production acceptance.
+A ticket is complete only when:
+
+1. Its scope and automated checks are implemented.
+2. Ticket 01–05 regression tests, lint, and CI are green.
+3. Its live E2E criteria pass on a stable Vercel deployment with real
+   Telegram/Upstash/provider integration.
+4. Secrets and raw chat data do not appear in logs or diagnostics.
+5. README, environment template, deployment instructions, and the privacy notice
+   are updated with the feature.
+
+Tickets 01–04 have completed the local implementation and automated-check
+portion. Their live Vercel/Telegram/Upstash/QStash/NVIDIA acceptance checks
+remain pending authorized deployment and provider interaction.

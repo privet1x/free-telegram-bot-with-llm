@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from app.settings import Settings
+from app.settings import Settings, production_config_errors
 
 
 def test_env_example_is_a_valid_settings_template():
@@ -14,12 +14,67 @@ def test_env_example_is_a_valid_settings_template():
     assert configured.FACT_CHECK_MAX_QUERIES == 3
     assert configured.QSTASH_URL == "https://qstash.upstash.io"
     assert configured.HISTORY_RETENTION_SECONDS == 2_592_000
+    assert configured.JOB_RETENTION_SECONDS == 604_800
+    assert configured.WORKER_BUDGET_SECONDS == 240
+    assert configured.JOB_LEASE_SECONDS == 270
 
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("HISTORY_RETENTION_SECONDS", 0), ("FACT_CHECK_MAX_QUERIES", 4)],
+    [
+        ("HISTORY_RETENTION_SECONDS", 0),
+        ("FACT_CHECK_MAX_QUERIES", 4),
+        ("JOB_RETENTION_SECONDS", 0),
+        ("WORKER_BUDGET_SECONDS", True),
+        ("JOB_LEASE_SECONDS", False),
+    ],
 )
 def test_bounded_cost_and_retention_settings(field, value):
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **{field: value})
+
+
+def _ticket_02_settings(**overrides):
+    values = {
+        "TELEGRAM_BOT_TOKEN": "telegram-token",
+        "TELEGRAM_BOT_USERNAME": "test_bot",
+        "TELEGRAM_WEBHOOK_SECRET": "webhook-secret",
+        "TELEGRAM_ALLOWED_CHAT_ID": -100,
+        "PUBLIC_BASE_URL": "https://bot.example",
+        "UPSTASH_REDIS_REST_URL": "https://redis.example",
+        "UPSTASH_REDIS_REST_TOKEN": "redis-token",
+        "NVIDIA_API_KEY": "nvidia-key",
+        "QSTASH_URL": "https://qstash.upstash.io",
+        "QSTASH_TOKEN": "qstash-token",
+        "QSTASH_CURRENT_SIGNING_KEY": "current-key",
+        "QSTASH_NEXT_SIGNING_KEY": "next-key",
+        "SUPER_ADMIN_ID": 5,
+        "SESSION_SECRET": "x" * 32,
+        "TELEGRAM_OIDC_CLIENT_ID": "oidc-client",
+        "TELEGRAM_OIDC_CLIENT_SECRET": "oidc-secret",
+    }
+    values.update(overrides)
+    return Settings(_env_file=None, **values)
+
+
+def test_ticket_02_production_configuration_is_ready():
+    assert production_config_errors(_ticket_02_settings()) == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"WORKER_BUDGET_SECONDS": 270}, "WORKER_BUDGET_SECONDS"),
+        ({"JOB_LEASE_SECONDS": 240}, "JOB_LEASE_SECONDS"),
+        ({"JOB_LEASE_SECONDS": 300}, "JOB_LEASE_SECONDS"),
+        ({"LLM_MODEL_FAST": "another-model"}, "LLM_MODEL_FAST"),
+        ({"QSTASH_URL": "http://qstash.example"}, "QSTASH_URL"),
+        ({"QSTASH_CURRENT_SIGNING_KEY": ""}, "QSTASH_CURRENT_SIGNING_KEY"),
+        ({"QSTASH_NEXT_SIGNING_KEY": ""}, "QSTASH_NEXT_SIGNING_KEY"),
+        ({"NVIDIA_API_KEY": ""}, "NVIDIA_API_KEY"),
+    ],
+)
+def test_ticket_02_production_configuration_rejects_unsafe_values(
+    overrides, expected
+):
+    assert expected in production_config_errors(_ticket_02_settings(**overrides))

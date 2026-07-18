@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from urllib.parse import urlsplit
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -52,19 +52,59 @@ class Settings(BaseSettings):
     QSTASH_TOKEN: str = ""
     QSTASH_CURRENT_SIGNING_KEY: str = ""
     QSTASH_NEXT_SIGNING_KEY: str = ""
+    JOB_RETENTION_SECONDS: int = Field(default=604_800, ge=1)
+    WORKER_BUDGET_SECONDS: int = Field(default=240, ge=1)
+    JOB_LEASE_SECONDS: int = Field(default=270, ge=1)
+
+    # Automatic intervention (ticket 03)
+    AUTO_TRIGGER_COOLDOWN_SECONDS: int = Field(default=30, ge=1)
+    MAX_LIST_POLICIES: int = Field(default=10, ge=1, le=10)
+    MAX_RULE_POLICIES: int = Field(default=10, ge=1, le=10)
 
     # Admin panel / sessions (ticket 05)
     SUPER_ADMIN_ID: int | None = None
     SESSION_SECRET: str = ""
+    TELEGRAM_OIDC_CLIENT_ID: str = ""
+    TELEGRAM_OIDC_CLIENT_SECRET: str = ""
 
     # General
     PUBLIC_BASE_URL: str = ""
+
+    @field_validator(
+        "JOB_RETENTION_SECONDS",
+        "WORKER_BUDGET_SECONDS",
+        "JOB_LEASE_SECONDS",
+        "AUTO_TRIGGER_COOLDOWN_SECONDS",
+        "MAX_LIST_POLICIES",
+        "MAX_RULE_POLICIES",
+        mode="before",
+    )
+    @classmethod
+    def reject_boolean_job_limits(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("boolean values are not valid job limits")
+        return value
 
 
 settings = Settings()
 
 
 _WEBHOOK_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
+_EXPECTED_FLASH_MODEL = "deepseek-ai/deepseek-v4-flash"
+_VERCEL_MAX_DURATION_SECONDS = 300
+
+
+def _is_https_base_url(value: str) -> bool:
+    parsed = urlsplit(value)
+    return bool(
+        parsed.scheme == "https"
+        and parsed.netloc
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path in {"", "/"}
+        and not parsed.query
+        and not parsed.fragment
+    )
 
 
 def production_webhook_config_errors(config: Settings = settings) -> list[str]:
@@ -86,16 +126,7 @@ def production_webhook_config_errors(config: Settings = settings) -> list[str]:
     ):
         errors.append("TELEGRAM_WEBHOOK_SECRET")
     if config.PUBLIC_BASE_URL:
-        parsed = urlsplit(config.PUBLIC_BASE_URL)
-        if (
-            parsed.scheme != "https"
-            or not parsed.netloc
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.path not in {"", "/"}
-            or parsed.query
-            or parsed.fragment
-        ):
+        if not _is_https_base_url(config.PUBLIC_BASE_URL):
             errors.append("PUBLIC_BASE_URL")
     if config.UPSTASH_REDIS_REST_URL:
         parsed = urlsplit(config.UPSTASH_REDIS_REST_URL)
@@ -103,4 +134,54 @@ def production_webhook_config_errors(config: Settings = settings) -> list[str]:
             errors.append("UPSTASH_REDIS_REST_URL")
     if isinstance(config.TELEGRAM_ALLOWED_CHAT_ID, bool) or config.TELEGRAM_ALLOWED_CHAT_ID == 0:
         errors.append("TELEGRAM_ALLOWED_CHAT_ID")
+    return sorted(set(errors))
+
+
+def production_config_errors(config: Settings = settings) -> list[str]:
+    """Return names of missing or unsafe production settings through Ticket 02."""
+    errors = production_webhook_config_errors(config)
+    required = {
+        "NVIDIA_API_KEY": config.NVIDIA_API_KEY,
+        "QSTASH_TOKEN": config.QSTASH_TOKEN,
+        "QSTASH_CURRENT_SIGNING_KEY": config.QSTASH_CURRENT_SIGNING_KEY,
+        "QSTASH_NEXT_SIGNING_KEY": config.QSTASH_NEXT_SIGNING_KEY,
+    }
+    errors.extend(name for name, value in required.items() if not value)
+    if not isinstance(config.SUPER_ADMIN_ID, int) or isinstance(config.SUPER_ADMIN_ID, bool) or config.SUPER_ADMIN_ID <= 0:
+        errors.append("SUPER_ADMIN_ID")
+    if len(config.SESSION_SECRET.encode()) < 32:
+        errors.append("SESSION_SECRET")
+    if not config.TELEGRAM_OIDC_CLIENT_ID:
+        errors.append("TELEGRAM_OIDC_CLIENT_ID")
+    if not config.TELEGRAM_OIDC_CLIENT_SECRET:
+        errors.append("TELEGRAM_OIDC_CLIENT_SECRET")
+
+    if config.LLM_MODEL_FAST != _EXPECTED_FLASH_MODEL:
+        errors.append("LLM_MODEL_FAST")
+    if config.QSTASH_URL and not _is_https_base_url(config.QSTASH_URL):
+        errors.append("QSTASH_URL")
+
+    integer_values = {
+        "JOB_RETENTION_SECONDS": config.JOB_RETENTION_SECONDS,
+        "WORKER_BUDGET_SECONDS": config.WORKER_BUDGET_SECONDS,
+        "JOB_LEASE_SECONDS": config.JOB_LEASE_SECONDS,
+        "AUTO_TRIGGER_COOLDOWN_SECONDS": config.AUTO_TRIGGER_COOLDOWN_SECONDS,
+        "MAX_LIST_POLICIES": config.MAX_LIST_POLICIES,
+        "MAX_RULE_POLICIES": config.MAX_RULE_POLICIES,
+    }
+    for name, value in integer_values.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(name)
+
+    budget = config.WORKER_BUDGET_SECONDS
+    lease = config.JOB_LEASE_SECONDS
+    if (
+        isinstance(budget, bool)
+        or not isinstance(budget, int)
+        or isinstance(lease, bool)
+        or not isinstance(lease, int)
+        or not 0 < budget < lease < _VERCEL_MAX_DURATION_SECONDS
+    ):
+        errors.extend(["WORKER_BUDGET_SECONDS", "JOB_LEASE_SECONDS"])
+
     return sorted(set(errors))

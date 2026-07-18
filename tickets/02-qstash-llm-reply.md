@@ -1,296 +1,266 @@
-# TICKET-02 — Durable QStash job и базовый LLM-ответ на mention/reply
+# TICKET-02 — Durable QStash Jobs and Basic Flash Replies for Mentions and Replies
 
-**Размер:** L · **Зависит от:** 01 · **Разблокирует:** 03
-**Общий контракт:** `00-ARCHITECTURE.md`
+**Size:** L · **Depends on:** 01 · **Unblocks:** 03
+**Shared contract:** 00-ARCHITECTURE.md
 
-## Цель
+## Goal
 
-Добавить надёжный асинхронный путь Telegram → Redis snapshot → QStash →
-`deepseek-ai/deepseek-v4-flash` → Telegram. Бот отвечает на точное упоминание
-своего username и reply именно на сообщение этого бота, использует контекст на
-момент обращения и не теряет job при сбое между receive/enqueue/process/deliver.
+Add a reliable asynchronous path:
 
-После тикета slow LLM никак не удерживает Telegram webhook. Повтор Telegram или
-QStash не должен повторно генерировать уже сохранённый ответ или создавать
-второй ответ после состояния `delivered`.
+~~~text
+Telegram → Redis snapshot → QStash → DeepSeek V4 Flash → Telegram
+~~~
 
-## Предусловия из Ticket 01
+The bot replies to an exact mention of its username and to a reply to a message
+sent by this bot. It uses context captured at trigger time and must not lose a
+job across receive, enqueue, process, or delivery failures.
 
-- Secret и `TELEGRAM_ALLOWED_CHAT_ID` проверяются **до** history/job logic.
-- Webhook установлен с `max_connections=1`, поэтому updates единственной группы
-  попадают в snapshot/history последовательно.
-- Входящие message/edit атомарно upsert-ятся по `message_id`; observed user index
-  обновляется; история ограничена 30 элементами, per-record retention и sliding
-  key TTL.
-- Модель сообщения содержит nested `reply_to` с `message_id`, `user_id`,
-  `is_bot` и текстом.
+Slow LLM work must never hold a Telegram webhook open. A Telegram or QStash retry
+must not regenerate a saved answer or create another answer after delivered.
 
-## Поводы ответа
+## Preconditions supplied by Ticket 01
 
-Webhook создаёт reply job только если:
+- Secret and TELEGRAM_ALLOWED_CHAT_ID are checked before history or job logic.
+- The webhook is registered with max_connections=1, so updates for the one group
+  arrive in context/history order.
+- Incoming messages and edits upsert atomically by message_id. The user directory
+  is updated. History is limited to 30 records and applies its record cutoff and
+  sliding list TTL.
+- The message model stores nested reply metadata: message_id, user_id, is_bot,
+  and bounded text.
 
-1. Telegram entity типа `mention` указывает ровно на
-   `@<TELEGRAM_BOT_USERNAME>` (case-insensitive comparison; offsets Telegram
-   декодируются как UTF-16 code units, а не Python code points); или
-2. `reply_to.user_id` равен проверенному numeric ID **текущего** бота.
+## Reply triggers
 
-`from.is_bot=true` недостаточно: reply другому боту не запускает job. Команды с
-суффиксом обрабатываются только если суффикс совпадает с username текущего бота.
-Обычный текст в этом тикете только логируется. `edited_message` исправляет
-history/user record, но не создаёт повторный LLM-ответ. `cooldown:auto:*` к явным
-mention/reply не применяется.
+Create a reply job only if one of the following is true:
 
-## Объём работ
+1. A Telegram mention entity resolves exactly to
+   @<TELEGRAM_BOT_USERNAME>, case-insensitively. Telegram entity offsets are
+   UTF-16 code units, not Python code-point offsets.
+2. reply_to.user_id equals the verified numeric ID of the current bot.
 
-### 0. Identity и admin primitive
+from.is_bot=true alone is insufficient: a reply to another bot must not trigger
+this bot. Commands with a suffix count only when the suffix names this bot.
+Ordinary text is logged but does not get an LLM reply in this ticket.
+edited_message repairs history and users only; it never creates an LLM job.
+The future auto-route cooldown does not apply to explicit mention/reply jobs.
 
-- [ ] Лениво вызвать Telegram `getMe`, проверить совпадение username из env и
-  bounded-cache сохранить `{id, username}` в `bot:self`; при невозможности
-  подтвердить identity routed updates получают retryable error, а не сравнение
-  с любым `is_bot=true`.
-- [ ] Mention extractor корректно режет Telegram UTF-16 offsets, поддерживает
-  text/caption entities и сравнивает извлечённый токен целиком.
-- [ ] Добавить минимальный `app/store/admins.py`: `is_admin(user_id)` учитывает
-  `SUPER_ADMIN_ID` и Redis set `admins`. CRUD появится позже, но prompt уже
-  получает вычисленную роль.
+## Scope
+
+### 0. Bot identity and admin primitive
+
+- [x] Lazily call getMe, verify the username against environment configuration,
+  and cache verified numeric ID and username in bot:self. If identity cannot be
+  verified, routed work returns retryable failure instead of treating any bot
+  message as this bot.
+- [x] Implement a mention extractor with correct UTF-16 offsets for text and
+  caption entities and exact full-token comparison.
+- [x] Add app/store/admins.py. is_admin(user_id) checks SUPER_ADMIN_ID and the
+  Redis admins set. Ticket 05 adds CRUD, but prompt construction already uses the
+  computed role.
 
 ### 1. QStash adapter
 
-- [ ] `app/queue/qstash.py`:
-  - async `publish(job_id)` на
-    `{PUBLIC_BASE_URL}/api/telegram/process` с body только
-    `{"job_id":"<update_id>"}`;
-  - deduplication ID `telegram-<update_id>`;
-  - exact `Upstash-Retries: 3` (1 + 3 = не более 4 доставок),
-    `Upstash-Retry-Delay: max(275000, exp(2.5 * retried) * 1000)` и failure callback
-    `{PUBLIC_BASE_URL}/api/telegram/failure`;
-  - `verify(raw_body, signature, url)` через официальный receiver, с current и
-    next signing keys; проверяется исходный body до JSON parsing;
-  - заданные connect/read/total timeouts; секреты/тело не логируются.
-- [ ] Publish adapter возвращает QStash `messageId`; webhook сохраняет его в
-  job атомарно вместе с enqueue metadata. Если worker уже перевёл
-  `received` в более поздний state, metadata всё равно записывается без state
-  downgrade. Несовпадающий `messageId` для того же job — integrity error.
-- [ ] Никогда не публиковать сырой Telegram update, текст, username или snapshot.
-  QStash получает только job ID.
-- [ ] Settings/`.env.example` и production readiness добавляют `NVIDIA_API_KEY`, QStash token/current+next
-  signing keys, `JOB_RETENTION_SECONDS=604800`, `WORKER_BUDGET_SECONDS=240`,
-  `JOB_LEASE_SECONDS=270`. Validation требует `0 < budget < lease < maxDuration`,
-  exact HTTPS `PUBLIC_BASE_URL`, обе signing keys и confirmed Flash model. Health называет
-  только missing/invalid dependency names.
+- [x] Implement app/queue/qstash.py with async publish(job_id) to
+  {PUBLIC_BASE_URL}/api/telegram/process and body only:
 
-### 2. Создание durable job в webhook
+  ~~~json
+  {"job_id":"<update_id>"}
+  ~~~
 
-- [ ] После secret/chat gate определить route. Для нового mention/reply **до
-  upsert текущего trigger**:
-  - получить до 30 уже существующих chronological history records;
-  - сохранить triggering message отдельно, не добавляя его в context list;
-  - сохранить reply target snapshot отдельно;
-  - создать `job:{update_id}` в `received` через atomic create-if-absent.
-- [ ] Затем идемпотентно upsert-ить current history/user и только после успеха
-  публиковать job. Если history write падает, `received` job остаётся, Telegram
-  retry переиспользует его snapshot и завершает upsert/publish.
-- [ ] `request_json` содержит:
-  - `kind="reply"`, `chat_id`, `update_id`, `trigger_message_id`;
-  - author snapshot (`id`, `name`, `username`);
-  - triggering text/entities;
-  - reply context или `null`;
-  - не более 30 предшествующих нормализованных history records.
-- [ ] Publish выполняется после сохранения snapshot. Успех переводит job в
-  `enqueued`; ошибка оставляет `received` и возвращает Telegram `503`, чтобы тот
-  повторил update. Повтор webhook переиспользует существующий snapshot и тот же
-  QStash dedup ID.
-- [ ] Race `callback before publish response` поддерживается явно: подписанный
-  worker может CAS `received→processing`; webhook после успешного publish
-  reload-ит job и считает `processing/ready_to_deliver/delivered` успешным
-  enqueue, не пытаясь откатить state в `enqueued`.
-- [ ] `enqueued`, `processing`, `ready_to_deliver`, `delivered` и terminal failed
-  подтверждаются webhook как `200`; ранний receipt/dedup marker сам по себе не
-  имеет права остановить незавершённый enqueue.
-- [ ] Для unrouted update `dedup:update:*` ставится после history/users. Для
-  routed update тот же финальный marker ставится только после durable job и
-  успешного `enqueued`; retry с marker absent продолжает сохранённый job, а не
-  пересобирает snapshot по новой конфигурации.
+- [x] Set deduplication ID telegram-<update_id>, Upstash-Retries: 3 (at most four
+  deliveries), Upstash-Retry-Delay:
+  max(275000, exp(2.5 * retried) * 1000), and failure callback
+  {PUBLIC_BASE_URL}/api/telegram/failure.
+- [x] Verify raw QStash body and signature against the canonical destination URL
+  with the official receiver and both current and next signing keys. Verify
+  before JSON parsing. Use bounded connect/read/total timeouts; never log
+  secrets or body contents.
+- [x] Publish returns QStash messageId. Save it atomically with enqueue metadata.
+  If a callback already advanced the job, record metadata without downgrading
+  state. A different messageId for the same job is an integrity error.
+- [x] Never put a raw Telegram update, text, username, transcript, or snapshot in
+  QStash. It receives a job ID only.
+- [x] Add NVIDIA_API_KEY, QStash token, both signing keys,
+  JOB_RETENTION_SECONDS=604800, WORKER_BUDGET_SECONDS=240, and
+  JOB_LEASE_SECONDS=270 to settings/readiness. Validate
+  0 < worker budget < lease < Vercel maxDuration, exact HTTPS public URL, both
+  signing keys, and the expected Flash model. Health reports only dependency
+  names, never values.
 
-### 3. Job store и state machine
+### 2. Durable job creation in the webhook
 
-- [ ] `app/store/jobs.py`: типизированное чтение, atomic/CAS transitions,
-  increment attempts, token lease, сохранение placeholder/chunk checkpoints,
-  answer и санитизированного error class.
-- [ ] При create job один раз фиксируется immutable absolute `expires_at = now + JOB_RETENTION_SECONDS`
-  (default 7 суток). Все job/answer/evidence/intent/checkpoint keys получают EX = remaining
-  lifetime до этого exact `expires_at`; stage write/renew не может refresh-нуть данные дольше
-  privacy indexes. `jobs:chat:*`/`jobs:user:*` всегда score тот же `expires_at`.
-  Worker имеет hard budget 240s, lease 270s и owner-only renewal каждые 60s;
-  lease освобождается compare-and-delete только владельцем.
-- [ ] Lease содержит monotonically increasing fencing generation. Перед LLM,
-  каждым Telegram edit/send и terminal transition worker атомарно проверяет
-  ownership/fence **и allowed non-terminal state**. Потеря renewal запрещает side effect и
-  возвращает retryable status; busy lease возвращает `503` + bounded
-  `Retry-After` по remaining TTL. timeouts всех стадий гарантируют остановку до 240s.
-- [ ] При создании job индексировать его в sorted sets `jobs:chat:*` и
-  `jobs:user:*` score=`job_expires_at` для privacy purge Ticket 05. Lookup сначала
-  делает `ZREMRANGEBYSCORE`; `ZREM` выполняется при реальном удалении/purge job,
-  но не сразу при `delivered`, пока private snapshot ещё живёт. Поэтому stale
-  job IDs не живут в refreshable SET вечно и остаются доступны privacy purge.
-- [ ] Невалидные переходы не молча перезаписывают более позднее состояние.
-- [ ] `delivered` — единственный успешный terminal state; он устанавливается
-  только после Telegram delivery всех частей.
+- [x] After secret/chat gating, determine the route. For a new mention/reply,
+  before upserting the trigger:
+  - obtain up to 30 existing history records in chronological order;
+  - store the triggering message separately, not in the context list;
+  - store a reply-target snapshot or null;
+  - atomically create job:<update_id> in received state if absent.
+- [x] Then idempotently upsert current history/user and publish only after that
+  succeeds. If history write fails, received remains and a Telegram retry
+  completes history and publication using the original snapshot.
+- [x] request_json stores kind="reply", chat_id, update_id,
+  trigger_message_id, author ID/name/username snapshot, trigger text/entities,
+  reply context or null, and no more than 30 preceding normalized records.
+- [x] Snapshot the trusted effective policy at creation, including the numeric
+  actor ID and server-computed administrator role. A later role or configuration
+  change must not alter queued work.
+- [x] Successful publication changes state to enqueued. Publish failure leaves
+  received and returns Telegram 503. A retry reuses the same snapshot and QStash
+  deduplication ID.
+- [x] Support callback-before-publish-response: a signed worker may change
+  received to processing; the webhook records messageId and treats
+  processing/ready_to_deliver/delivered as proof of enqueue rather than
+  reverting state.
+- [x] A final update dedup marker may acknowledge enqueued, processing,
+  ready_to_deliver, delivered, or terminal failure. It must not suppress an
+  incomplete enqueue merely because an early receipt exists.
+- [x] Unrouted updates write dedup:update after history/users. Routed updates use
+  the same final marker only after durable job logic reaches a safe point.
 
-### 4. NVIDIA/ChatNVIDIA client contract
+### 3. Job retention and indexes
 
-- [ ] Добавить pin `langchain-nvidia-ai-endpoints==1.4.3`.
-- [ ] `app/llm/client.py` лениво создаёт flash client:
+- [x] Every job-derived key, answer/evidence/intents/checkpoints, and job index
+  member expires no later than immutable job.expires_at. Do not refresh it on
+  retry.
+- [x] Maintain jobs:chat:<chat_id> and jobs:user:<user_id> sorted sets with score
+  equal to expires_at for privacy purge. Prune expired members before reads.
+- [x] Index every user whose data appears in the trigger, reply target, context,
+  or a nested reply, not only the triggering author.
+- [x] A job snapshot is immutable after creation except explicit checkpoints,
+  state, attempts, error class, and cancellation. Redis configuration changes
+  never alter a queued job's policy or context.
 
-  ```python
+### 4. Flash client and prompt boundary
+
+- [x] Add a lazy Flash factory with DeepSeek V4 Flash and the pinned wrapper:
+
+  ~~~python
   base = ChatNVIDIA(
       model="deepseek-ai/deepseek-v4-flash",
       api_key=settings.NVIDIA_API_KEY,
-      temperature=0.9,
-      top_p=0.95,
-      max_completion_tokens=1024,
+      temperature=0.4,
+      max_completion_tokens=2048,
   )
   client = base.with_thinking_mode(enabled=False)
-  ```
+  ~~~
 
-  Значение model берётся из `LLM_MODEL_FAST`, но production validation требует
-  подтверждённый ID `deepseek-ai/deepseek-v4-flash`.
-- [ ] Не использовать `extra_body={...}`: в текущем wrapper это может создать
-  неверно вложенное поле. Контрактный HTTP-тест перехватывает сериализованный
-  запрос и проверяет `chat_template_kwargs.thinking=false`, отсутствие literal
-  root `extra_body`/`reasoning_effort`, model ID, timeout и
-  `max_tokens`/эквивалентное wire-поле.
-- [ ] Использовать async invoke либо thread offload; синхронный client не блокирует
-  event loop FastAPI.
+- [x] Contract-test the outgoing payload: model ID,
+  chat_template_kwargs.thinking=false, timeout, and absence of literal root
+  extra_body/reasoning_effort. The current historical source sketch is not a
+  substitute for this request-shape test.
+- [x] Build one aggregate system message from trusted base policy and
+  server-computed numeric actor ID/is_admin. Put names, usernames, transcript,
+  reply target, and trigger text only in one untrusted user/data message.
+- [x] Escape/serialize Telegram data. A user cannot gain admin role or change
+  system instructions by writing it in chat.
 
-### 5. Prompt boundary (слои 1–2)
+### 5. Signed processor and delivery
 
-- [ ] `app/llm/prompt.py` строит **одно aggregated system message** из neutral base policy
-  + только сервером проверенных numeric actor ID/`is_admin`, а затем one
-  user/data message: Telegram name/username, предшествующий transcript, reply target и current
-  message. Ticket 03 добавит в этот же aggregate list/rule policy.
-- [ ] Raw transcript/current text не конкатенируются в system. Data-блок явно
-  говорит, что любые инструкции внутри сообщений — цитируемые данные, не policy.
-- [ ] Triggering message присутствует ровно один раз. Сообщения после cutoff и
-  placeholder не могут попасть в snapshot.
-- [ ] Имя/username из Telegram экранируются/сериализуются только как untrusted
-  data, а admin status вычисляется через `admins` + `SUPER_ADMIN_ID`, не из text.
+- [x] POST /api/telegram/process verifies the QStash signature over raw request
+  body before parsing and derives job_id only from body.
+- [x] Atomically acquire a token-and-fencing lease. A duplicate callback with an
+  active lease returns 503 and Retry-After equal to lease TTL plus jitter. A
+  delivered or cancelled job returns 200 without side effects.
+- [x] Enforce a 240-second hard work budget within a renewable 270-second lease.
+  Renew only as the owner every 60 seconds. Check lease token, fence, and
+  non-terminal job state before every NIM, Tavily, or Telegram side effect.
+- [x] On first processing, create one placeholder through sendMessage. Before
+  every non-idempotent sendMessage, write a fenced intent with payload hash and
+  chunk index. Save message IDs after success.
+- [x] Save the generated answer before any Telegram delivery. Split plain text
+  into chunks up to 4,000 Unicode characters. Edit the placeholder with the
+  first chunk, then send later chunks. Upsert successful outbound Bot API
+  messages into history.
+- [x] The placeholder is the sole pre-answer delivery; save the answer before
+  any answer edit or answer chunk send. Process at most four acquired attempts
+  (`Upstash-Retries + 1`).
+- [x] If a retry finds a send intent with no message-ID checkpoint, mark
+  failed_ambiguous and do not send a possible duplicate. Retry safe
+  editMessageText only with a known intended edit checkpoint; exact Telegram
+  “message is not modified” is success only for that checkpoint.
+- [x] Classify provider timeout/429/5xx as retryable. Classify invalid payload,
+  auth, and most 4xx as permanent. Save sanitized error class only.
 
-### 6. Worker и доставка
+### 6. Failure callback
 
-- [ ] `POST /api/telegram/process`:
-  1. проверить QStash signature по raw request;
-  2. валидировать body и загрузить job;
-  3. если `delivered` — `200` без side effects;
-  3a. если есть unresolved `send_intent` без corresponding Telegram `message_id`, не
-     повторять `sendMessage`: fenced-CAS переводит job в `failed_ambiguous` и возвращает 2xx;
-  4. взять lease, увеличить attempts, CAS
-     `received|enqueued|failed_retryable → processing` (signed callback сам
-     доказывает, что QStash принял publish);
-  5. перед `sendMessage` placeholder сохранить fenced `send_intent(kind=placeholder, payload_hash)`,
-     затем после result ID атомарно checkpoint-ить ID и clear intent; делать это только
-     если placeholder ID ещё не сохранён;
-  6. если `job:*:answer` отсутствует — собрать prompt, вызвать flash и сохранить
-     answer **до** доставки;
-  7. детерминированно split answer, edit placeholder первой частью, а перед каждым
-     последующим `sendMessage` сохранить `send_intent(chunk_index,payload_hash)`; после result ID
-     атомарно checkpoint-ить ID и clear intent. `editMessageText` по known ID остаётся retryable;
-  8. upsert-ить каждый исходящий bot message/edit в history;
-  9. после всех частей перейти в `delivered`, затем `200`.
-- [ ] `POST /api/telegram/failure` сначала проверяет QStash signature по raw body и
-  exact canonical failure URL, затем typed-парсит официальный callback envelope.
-  Для correlation обязательны `sourceMessageId`, `sourceBody`, `url`, `retried`,
-  `maxRetries` и `status`; `dlqId` может отсутствовать. Provider-added unknown
-  fields игнорируются, но не логируются.
-- [ ] `sourceBody` base64-decode-ится с strict validation и лимитом 256 bytes;
-  decoded JSON должен иметь ровно `{"job_id":"<id>"}`. Затем route
-  требует exact `url == PUBLIC_BASE_URL + "/api/telegram/process"`, равенство
-  `sourceMessageId` с сохранённым job `qstash_message_id` и `retried >= maxRetries`.
-  Если job есть, но `qstash_message_id` ещё не сохранён из-за callback-before-publish-response race,
-  route возвращает retryable `503`, не terminal result; wrong **present** ID отклоняется.
-  Job ID никогда не берётся из callback response `body`.
-- [ ] Если у job есть active lease, failure route не терминализирует его: он
-  возвращает `503` + `Retry-After` по remaining TTL, чтобы live worker либо delivered,
-  либо потерял lease. После expiry только correlation route одним CAS переводит
-  non-terminal job в `failed`, increment-ит fence и delete-ит lease, сохраняет sanitized
-  `{status, retried, max_retries, error_class, dlq_id?}` и `failure_notice_pending=true`.
-- [ ] Known placeholder меняется на failure text по checkpoint-у `failure_notice_delivered`. Если
-  process/edit падает после terminal CAS, дубликат callback или dedicated failure-notice retry
-  может довести только этот idempotent edit; после checkpoint дубликаты terminal
-  `2xx` без overwrite. `body`, `sourceBody`, `header`, `sourceHeader` не хранятся и не логируются.
-- [ ] `send_message` возвращает нормализованный Telegram `result`, поэтому
-  `message_id` берётся как `message["message_id"]`, а не из внешнего
-  `{ok, result}` envelope.
-- [ ] Все LLM-ответы используют общий paragraph-aware splitter `<=4000`
-  символов, plain text, без `parse_mode`. Первая часть reply-ится на triggering
-  message; последующие части сохраняют порядок.
-- [ ] Точный Bot API 400 `message is not modified` при повторе известного
-  `editMessageText` считается success соответствующего checkpoint; остальные
-  Telegram 400 остаются permanent.
+- [x] POST /api/telegram/failure first verifies signature over raw body. Derive
+  source job ID only from bounded base64-decoded sourceBody; require exact
+  sourceMessageId, exact process URL, and exhausted retry counters matching the
+  job. Ignore untrusted callback response body.
+- [x] If the callback arrives before publish metadata, return retryable 503 while
+  the job can still be running or publication can still complete. If an active
+  lease exists, return 503 plus Retry-After.
+- [x] After lease expiry, CAS the job to failed, increment fence, delete lease,
+  and make every side-effect guard require both current fence and non-terminal
+  state.
+- [x] Failure notices have their own checkpoint:
+  failure_notice_pending/failure_notice_delivered. Duplicated callbacks may
+  complete only a known placeholder edit; they never create another message.
+- [x] When no placeholder is known, record that no notice is possible and never
+  call sendMessage. A dedicated fenced edit for a pending notice on `failed` is
+  the only terminal-state side-effect exception; a permanent edit rejection is
+  checkpointed as failure_notice_failed_permanent.
+- [x] Do not log response bodies, callback headers, secrets, or transcript.
 
-### 7. Ошибки и ретраи
+## Error and limit policy
 
-| Ситуация | Поведение worker |
+| Condition | Outcome |
 |---|---|
-| NVIDIA/Telegram timeout до известного ответа, 429, 5xx | `failed_retryable`, HTTP 503 QStash, reuse snapshot/answer/placeholder |
-| Worker занят live lease | HTTP 503 + `Retry-After` по TTL; не тратить side effect/attempt |
-| Невалидный job/body, неподдерживаемая route | terminal `failed`, 2xx после bookkeeping |
-| NVIDIA auth/validation 4xx, Telegram 400 кроме exact idempotent edit no-op | terminal `failed`, user-visible placeholder error |
-| Invalid QStash signature | 401; никаких state changes |
-| Лимит попыток исчерпан | failure callback/DLQ → `failed` |
-| `sendMessage` завершился ambiguous network timeout | `failed_ambiguous`, не слепо повторять возможный дубль; ручная проверка |
-| Crash после `sendMessage`, но до checkpoint ID | unresolved pre-send intent → `failed_ambiguous`, не resend |
+| NVIDIA or Telegram timeout/429/5xx before a known result | failed_retryable, HTTP 503 to QStash, reuse saved snapshot/answer/placeholder |
+| QStash bad signature | HTTP 401, no state change |
+| QStash body invalid/oversized or wrong metadata | HTTP 400/401, no state change |
+| Telegram network timeout after a send intent | failed_ambiguous, no resend |
+| Telegram exact intended edit says message is not modified | checkpointed success |
+| Invalid model response or permanent provider error | failed |
+| Cancelled/delivered job | HTTP 200, no side effect |
 
-Повтор после сохранённого answer не вызывает LLM снова. Повтор
-`editMessageText` для известного placeholder идемпотентен. Application logs
-содержат `job_id`, transition, latency и error class, но не prompt/answer/token.
+## Out of scope
 
-## Вне объёма
+- Automatic keyword routing, lists, and tone commands: Ticket 03.
+- /judge, /dispute, /deep, Pro, and Tavily: Ticket 04.
+- Web CRUD/UI and OIDC: Ticket 05.
 
-- Автоматические keyword triggers, списки и tone commands — Ticket 03.
-- `/judge`, pro и Tavily — Ticket 04.
-- Admin UI/API — Ticket 05.
+## Automated checks
 
-## Автоматические проверки
+- [x] Mention entity for this bot, another bot, captions, emoji before mention,
+  and UTF-16 offsets.
+- [x] Reply to this bot versus reply to another bot; command suffix handling;
+  edit updates history but never queues.
+- [x] Snapshot excludes trigger and later messages; context remains stable across
+  Telegram retry and configuration changes.
+- [x] QStash publish body privacy, deduplication ID, retry headers/delay, both
+  signature keys, and canonical URL.
+- [x] State transitions, publication failure/retry, callback-before-publish race,
+  failure-before-metadata race, active-lease callback race, lease renewal/fence,
+  and 240-second budget.
+- [x] Crash at every send-intent/checkpoint boundary, answer reuse, delivery
+  splitting, outbound history, and no duplicate sends.
+- [x] Failure callback malformed/missing/invalid/oversize sourceBody, wrong
+  destination/message ID, non-exhausted retries, duplicate/terminal job, and
+  expiry of every job-derived key.
+- [x] ChatNVIDIA request-shape contract and Telegram exact edit normalization.
+- [x] Ticket 01 regression tests and Ruff remain green.
+- [ ] Python 3.12 CI remains green (not locally available; pending CI).
 
-- [ ] Unit: mention entity текущего бота; mention другого бота; reply текущему
-  боту; reply другому боту; emoji перед mention (UTF-16 offset); command suffix
-  текущего/чужого бота; edit упдейтит history, но не enqueue-ится.
-- [ ] Unit: context cutoff, edit upsert, current message ровно один раз, outbound
-  history, Unicode splitting на границах 4000.
-- [ ] State-machine: publish failure + Telegram retry; crash после enqueue; crash → busy
-  lease → `Retry-After` → post-expiry recovery; callback-before-publish-response/
-  failure-before-publish-metadata races; fake-clock renewal/fence/240s budget; callback-vs-live-worker
-  fence race; retry после answer; retry after delivered; crash at every `sendMessage`
-  intent/checkpoint boundary; bounded failure-notice path.
-- [ ] Contract: QStash current/next signatures, exact retry headers/delay and `Retry-After`;
-  failure callback valid, malformed,
-  missing/invalid/oversize base64 `sourceBody`, wrong destination/message ID,
-  non-exhausted retries, missing metadata, duplicate и terminal job; every job-derived key
-  expires no later than its purge indexes; ChatNVIDIA
-  wire payload (`chat_template_kwargs.thinking=false`, model); Telegram shape и
-  exact `message is not modified` normalization.
-- [ ] Все тесты, Ticket 01 tests, `ruff` проходят в CI Python 3.12.
+## Live E2E acceptance
 
-## Критерии приёмки (live E2E)
+1. On a stable Vercel deployment, an @bot mention receives a coherent Flash reply
+   grounded in a fact from preceding conversation; a later message is absent.
+2. A reply to this bot considers reply-target text; a reply to another bot does
+   not run work.
+3. Ordinary text remains silent but is stored; another group or private chat is
+   not stored.
+4. One placeholder is replaced by plain-text output. An answer above 4,096
+   characters arrives in order and all outbound chunks appear in history.
+5. Telegram retries and QStash retries after delivered never create another
+   answer. A transient LLM failure recovers from the same snapshot.
+6. QStash body contains only job_id, and observability/contract tests show the
+   exact Flash model and non-thinking payload.
 
-1. На стабильном Vercel deployment `@bot` получает связный flash-ответ с фактом
-   из предыдущей переписки; последующее сообщение после trigger в ответ не
-   попадает.
-2. Reply на сообщение **этого** бота получает ответ и учитывает текст reply
-   target; reply другому боту ничего не запускает.
-3. Обычный текст молчит, но сохраняется; чужой chat/private chat не сохраняется.
-4. Видно один placeholder, который заменяется plain-text ответом; ответ >4096
-   приходит упорядоченными частями и все исходящие части видны в Redis history.
-5. Повтор webhook до/после publish и повтор QStash delivery после `delivered` не
-   создают второй ответ. Искусственный transient LLM failure успешно доезжает по
-   retry с тем же snapshot.
-6. В QStash body виден только job ID. Вызванная модель в contract/observability —
-   ровно `deepseek-ai/deepseek-v4-flash` с non-thinking contract.
+## Risks
 
-## Риски
-
-- Telegram не предоставляет idempotency key для первого `sendMessage`;
-  `failed_ambiguous` — осознанный no-duplicate компромисс для редкого timeout.
-- QStash retries расходуют quota; лимит ограничен, permanent errors не ретраятся.
-- LangChain холодный старт измеряется на live deployment; lazy import обязателен.
+- Telegram lacks a sendMessage idempotency key. failed_ambiguous is the deliberate
+  no-duplicate trade-off for a rare ambiguous network timeout.
+- QStash retries consume quota, so retry count is bounded and permanent errors
+  are not retried.
+- Lazy import of LangChain is required; verify cold-start latency on live Vercel.

@@ -18,7 +18,41 @@ import threading
 import time
 from typing import Optional, Protocol
 
+import httpx
+
 from app.settings import settings
+
+
+UPSTASH_REDIS_TIMEOUT = httpx.Timeout(
+    connect=3.0,
+    read=12.0,
+    write=5.0,
+    pool=3.0,
+)
+UPSTASH_LOCK_TIMEOUT_SECONDS = 2.0
+
+
+def build_upstash_redis(url: str, token: str):
+    """Create the pinned SDK client with bounded transport behavior.
+
+    Upstash Redis 1.7.0 exposes no public timeout argument and otherwise creates
+    an ``httpx.Client(timeout=None)``. Replacing that freshly-created, unused
+    transport is the narrow compatibility shim until the SDK exposes a timeout
+    option. Disabling SDK retries keeps a Redis operation inside one bounded
+    request instead of its fixed three-second retry sleep.
+    """
+    from upstash_redis import Redis
+
+    client = Redis(
+        url=url,
+        token=token,
+        rest_retries=0,
+        read_your_writes=True,
+    )
+    previous_transport = client._http._client
+    client._http._client = httpx.Client(timeout=UPSTASH_REDIS_TIMEOUT)
+    previous_transport.close()
+    return client
 
 
 class KV(Protocol):
@@ -47,6 +81,11 @@ class KV(Protocol):
     def observe_user_json(
         self, user_id: int, normalized_username: Optional[str], value: str
     ) -> str: ...
+    def sadd(self, key: str, *members: str) -> int: ...
+    def sismember(self, key: str, member: str) -> bool: ...
+    def smembers(self, key: str) -> set[str]: ...
+    def srem(self, key: str, *members: str) -> int: ...
+    def delete_if_value(self, key: str, expected: str) -> bool: ...
     def delete(self, *keys: str) -> int: ...
     def backend(self) -> str: ...
 
@@ -99,6 +138,7 @@ class MemoryKV:
         self._values: dict[str, str] = {}
         self._expiry: dict[str, float] = {}
         self._lists: dict[str, list[str]] = {}
+        self._sets: dict[str, set[str]] = {}
         self._lock = threading.RLock()
 
     def _purge_if_expired(self, key: str) -> None:
@@ -106,6 +146,7 @@ class MemoryKV:
         if exp is not None and exp <= time.time():
             self._values.pop(key, None)
             self._lists.pop(key, None)
+            self._sets.pop(key, None)
             self._expiry.pop(key, None)
 
     def ping(self) -> bool:
@@ -326,7 +367,10 @@ class MemoryKV:
                     if isinstance(owner, dict) and order(owner) >= order(incoming):
                         desired_username = None
                     else:
-                        if isinstance(owner, dict) and normalized(owner) == normalized_username:
+                        if (
+                            isinstance(owner, dict)
+                            and normalized(owner) == normalized_username
+                        ):
                             owner["username"] = None
                             self._set_unlocked(
                                 owner_key,
@@ -357,16 +401,57 @@ class MemoryKV:
                 self._set_unlocked(f"username:{desired_username}", str(user_id), None)
             return stored_raw
 
+    def sadd(self, key: str, *members: str) -> int:
+        with self._lock:
+            self._purge_if_expired(key)
+            values = self._sets.setdefault(key, set())
+            before = len(values)
+            values.update(str(member) for member in members)
+            return len(values) - before
+
+    def sismember(self, key: str, member: str) -> bool:
+        with self._lock:
+            self._purge_if_expired(key)
+            return str(member) in self._sets.get(key, set())
+
+    def smembers(self, key: str) -> set[str]:
+        with self._lock:
+            self._purge_if_expired(key)
+            return set(self._sets.get(key, set()))
+
+    def srem(self, key: str, *members: str) -> int:
+        with self._lock:
+            self._purge_if_expired(key)
+            values = self._sets.get(key, set())
+            removed = sum(1 for member in members if str(member) in values)
+            values.difference_update(str(member) for member in members)
+            if not values:
+                self._sets.pop(key, None)
+            return removed
+
+    def delete_if_value(self, key: str, expected: str) -> bool:
+        with self._lock:
+            self._purge_if_expired(key)
+            if self._values.get(key) != expected:
+                return False
+            self._values.pop(key, None)
+            self._expiry.pop(key, None)
+            return True
+
     def delete(self, *keys: str) -> int:
         with self._lock:
             removed = 0
             for key in keys:
                 existed = (
-                    key in self._values or key in self._lists or key in self._expiry
+                    key in self._values
+                    or key in self._lists
+                    or key in self._sets
+                    or key in self._expiry
                 )
                 self._values.pop(key, None)
                 self._expiry.pop(key, None)
                 self._lists.pop(key, None)
+                self._sets.pop(key, None)
                 if existed:
                     removed += 1
             return removed
@@ -379,35 +464,46 @@ class UpstashKV:
     """Production store on top of the Upstash Redis REST SDK."""
 
     def __init__(self, url: str, token: str) -> None:
-        from upstash_redis import Redis  # lazy import — not pulled in during tests
+        self._r = build_upstash_redis(url, token)
+        self._lock = threading.RLock()
 
-        self._r = Redis(url=url, token=token)
+    def _call(self, method: str, *args: object, **kwargs: object) -> object:
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._lock = lock
+        if not lock.acquire(timeout=UPSTASH_LOCK_TIMEOUT_SECONDS):
+            raise TimeoutError("Redis client contention")
+        try:
+            return getattr(self._r, method)(*args, **kwargs)
+        finally:
+            lock.release()
 
     def ping(self) -> bool:
-        return bool(self._r.ping())
+        return bool(self._call("ping"))
 
     def get(self, key: str) -> Optional[str]:
-        value = self._r.get(key)
+        value = self._call("get", key)
         return None if value is None else str(value)
 
     def set(self, key: str, value: str, ex: Optional[int] = None) -> None:
-        self._r.set(key, value, ex=ex)
+        self._call("set", key, value, ex=ex)
 
     def set_nx(self, key: str, value: str, ex: Optional[int] = None) -> bool:
         # Upstash .set(nx=True) returns "OK" on success and None if the key exists.
-        return bool(self._r.set(key, value, nx=True, ex=ex))
+        return bool(self._call("set", key, value, nx=True, ex=ex))
 
     def lpush(self, key: str, value: str) -> int:
-        return int(self._r.lpush(key, value))
+        return int(self._call("lpush", key, value))
 
     def ltrim(self, key: str, start: int, stop: int) -> None:
-        self._r.ltrim(key, start, stop)
+        self._call("ltrim", key, start, stop)
 
     def lrange(self, key: str, start: int, stop: int) -> list[str]:
-        return list(self._r.lrange(key, start, stop))
+        return list(self._call("lrange", key, start, stop))
 
     def llen(self, key: str) -> int:
-        return int(self._r.llen(key))
+        return int(self._call("llen", key))
 
     def list_upsert_json(
         self,
@@ -534,7 +630,8 @@ class UpstashKV:
         return redis.call('LLEN', KEYS[1])
         """
         return int(
-            self._r.eval(
+            self._call(
+                "eval",
                 script,
                 keys=[key],
                 args=[
@@ -579,7 +676,7 @@ class UpstashKV:
         end
         return #kept
         """
-        return int(self._r.eval(script, keys=[key], args=[field, str(min_value)]))
+        return int(self._call("eval", script, keys=[key], args=[field, str(min_value)]))
 
     def observe_user_json(
         self, user_id: int, normalized_username: Optional[str], value: str
@@ -675,17 +772,36 @@ class UpstashKV:
         return stored
         """
         return str(
-            self._r.eval(
+            self._call(
+                "eval",
                 script,
                 keys=[f"user:{user_id}"],
                 args=[str(user_id), value, normalized_username or ""],
             )
         )
 
+    def sadd(self, key: str, *members: str) -> int:
+        if not members:
+            return 0
+        return int(self._call("sadd", key, *members))
+
+    def sismember(self, key: str, member: str) -> bool:
+        return bool(self._call("sismember", key, member))
+
+    def smembers(self, key: str) -> set[str]:
+        return {str(item) for item in (self._call("smembers", key) or [])}
+
+    def srem(self, key: str, *members: str) -> int:
+        return int(self._call("srem", key, *members))
+
+    def delete_if_value(self, key: str, expected: str) -> bool:
+        script = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end"
+        return bool(self._call("eval", script, keys=[key], args=[expected]))
+
     def delete(self, *keys: str) -> int:
         if not keys:
             return 0
-        return int(self._r.delete(*keys))
+        return int(self._call("delete", *keys))
 
     def backend(self) -> str:
         return "upstash"

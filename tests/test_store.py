@@ -8,7 +8,24 @@ import pytest
 
 from app.store import history, users
 from app.store.dedup import mark_seen
-from app.store.redis import MemoryKV, UpstashKV, _redis_slice, get_store
+from app.store.redis import (
+    UPSTASH_REDIS_TIMEOUT,
+    MemoryKV,
+    UpstashKV,
+    _redis_slice,
+    build_upstash_redis,
+    get_store,
+)
+
+
+def test_pinned_upstash_sdk_uses_a_bounded_transport_without_network() -> None:
+    client = build_upstash_redis("https://redis.example", "test-token")
+    try:
+        assert client._http._retries == 0
+        assert client._read_your_writes is True
+        assert client._http._client.timeout == UPSTASH_REDIS_TIMEOUT
+    finally:
+        client.close()
 
 
 def test_set_nx_first_time_only():
@@ -146,9 +163,7 @@ def test_list_upsert_prunes_records_older_than_cutoff():
         min_value=150,
     )
 
-    assert [json.loads(item)["message_id"] for item in kv.lrange("hist", 0, -1)] == [
-        2
-    ]
+    assert [json.loads(item)["message_id"] for item in kv.lrange("hist", 0, -1)] == [2]
 
 
 def test_upstash_history_upsert_uses_one_atomic_eval():

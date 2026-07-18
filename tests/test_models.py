@@ -98,9 +98,7 @@ def test_parse_caption_and_caption_entities():
 
 def test_parse_bounds_main_and_reply_text_before_persistence():
     update = make_update(text="x" * (MAX_HISTORY_TEXT_CHARS + 10), reply_to_bot=True)
-    update["message"]["reply_to_message"]["text"] = "y" * (
-        MAX_HISTORY_TEXT_CHARS + 10
-    )
+    update["message"]["reply_to_message"]["text"] = "y" * (MAX_HISTORY_TEXT_CHARS + 10)
 
     msg = parse_update(update)
 
@@ -233,7 +231,9 @@ def test_call_rejects_telegram_api_error(monkeypatch):
             return FakeResponse()
 
     monkeypatch.setattr(telegram_client, "_http", lambda: FakeHTTP())
-    with pytest.raises(telegram_client.TelegramAPIError, match="rejected request") as exc:
+    with pytest.raises(
+        telegram_client.TelegramAPIError, match="rejected request"
+    ) as exc:
         telegram_client.call("sendMessage", {})
     assert exc.value.description == "Bad Request"
 
@@ -257,5 +257,138 @@ def test_call_redacts_token_bearing_transport_url(monkeypatch):
 
 def test_send_message_rejects_non_message_result(monkeypatch):
     monkeypatch.setattr(telegram_client, "call", lambda *_args, **_kwargs: True)
-    with pytest.raises(telegram_client.TelegramAPIError):
+    with pytest.raises(telegram_client.TelegramAPIError) as raised:
         telegram_client.send_message(100, "hello")
+    assert raised.value.outcome_unknown is True
+
+
+@pytest.mark.parametrize(
+    ("description", "expected"),
+    [
+        ("Bad Request: message is not modified", True),
+        (
+            "Bad Request: message is not modified: specified new message content "
+            "and reply markup are exactly the same as a current content and reply "
+            "markup of the message",
+            True,
+        ),
+        ("Bad Request: message cannot be edited", False),
+    ],
+)
+def test_message_not_modified_accepts_only_the_known_telegram_description_prefix(
+    description: str, expected: bool
+):
+    error = telegram_client.TelegramAPIError(
+        "safe error",
+        method="editMessageText",
+        status_code=400,
+        description=description,
+    )
+
+    assert error.message_not_modified is expected
+
+
+def test_edit_message_text_uses_plain_text_without_parse_mode(monkeypatch):
+    captured = {}
+
+    def fake_call(method, payload):
+        captured.update(method=method, payload=payload)
+        return {"message_id": 77}
+
+    monkeypatch.setattr(telegram_client, "call", fake_call)
+
+    telegram_client.edit_message_text(100, 77, "<b>plain</b>")
+
+    assert captured == {
+        "method": "editMessageText",
+        "payload": {"chat_id": 100, "message_id": 77, "text": "<b>plain</b>"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("length", "sizes"),
+    [
+        (0, []),
+        (1, [1]),
+        (3_999, [3_999]),
+        (4_000, [4_000]),
+        (4_001, [4_000, 1]),
+        (8_000, [4_000, 4_000]),
+        (8_001, [4_000, 4_000, 1]),
+    ],
+)
+def test_plain_text_split_boundaries(length, sizes):
+    chunks = telegram_client.split_plain_text("🙂" * length)
+    assert [len(chunk) for chunk in chunks] == sizes
+    assert "".join(chunks) == "🙂" * length
+
+
+def test_telegram_error_classification_and_exact_not_modified():
+    retryable = telegram_client.TelegramAPIError(
+        "sanitized", method="sendMessage", status_code=429
+    )
+    transport = telegram_client.TelegramAPIError(
+        "sanitized", method="sendMessage", transport_error=True
+    )
+    not_modified = telegram_client.TelegramAPIError(
+        "sanitized",
+        method="editMessageText",
+        status_code=400,
+        description="Bad Request: message is not modified",
+    )
+    wrong_method = telegram_client.TelegramAPIError(
+        "sanitized",
+        method="sendMessage",
+        status_code=400,
+        description="Bad Request: message is not modified",
+    )
+
+    assert retryable.retryable is True
+    assert transport.retryable is True
+    assert not_modified.message_not_modified is True
+    assert wrong_method.message_not_modified is False
+
+
+def test_telegram_timeout_and_pre_send_transport_are_retryable():
+    timeout = telegram_client.TelegramAPIError(
+        "sanitized", method="sendMessage", status_code=408
+    )
+    pre_send = telegram_client.TelegramAPIError(
+        "sanitized",
+        method="sendMessage",
+        transport_error=True,
+        outcome_unknown=False,
+    )
+
+    assert timeout.retryable is True
+    assert timeout.outcome_unknown is False
+    assert pre_send.retryable is True
+    assert pre_send.outcome_unknown is False
+
+
+def test_outbound_history_record_normalizes_successful_bot_message():
+    result = {
+        "message_id": 77,
+        "date": 1_784_200_100,
+        "chat": {"id": 100},
+        "from": {
+            "id": 999,
+            "is_bot": True,
+            "first_name": "Test",
+            "username": "test_bot",
+        },
+        "text": "Thinking…",
+    }
+
+    record = telegram_client.outbound_history_record(
+        result,
+        source_update_id=123,
+        fallback_chat_id=100,
+        fallback_user_id=999,
+    )
+
+    assert record["message_id"] == 77
+    assert record["source_update_id"] == 123
+    assert record["user_id"] == 999
+    assert record["text"] == "Thinking…"
+    assert record["is_bot"] is True

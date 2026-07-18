@@ -89,3 +89,39 @@ def test_health_handles_store_construction_failure(client, monkeypatch):
     assert response.json()["ok"] is False
     assert response.json()["store"] == "unavailable"
     assert "did not answer PING" in response.json()["warning"]
+
+
+def test_health_ticket_02_readiness_names_only_never_secret_values(
+    client, monkeypatch
+):
+    import app.server as server
+    from app.settings import settings
+
+    class HealthyUpstash:
+        def backend(self):
+            return "upstash"
+
+        def ping(self):
+            return True
+
+    canary = "DO_NOT_EXPOSE_SECRET_CANARY"
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.setattr(settings, "TELEGRAM_BOT_TOKEN", canary)
+    monkeypatch.setattr(settings, "TELEGRAM_BOT_USERNAME", "test_bot")
+    monkeypatch.setattr(settings, "TELEGRAM_WEBHOOK_SECRET", "valid-secret")
+    monkeypatch.setattr(settings, "TELEGRAM_ALLOWED_CHAT_ID", -100)
+    monkeypatch.setattr(settings, "PUBLIC_BASE_URL", "https://bot.example")
+    monkeypatch.setattr(settings, "UPSTASH_REDIS_REST_URL", "https://redis.example")
+    monkeypatch.setattr(settings, "UPSTASH_REDIS_REST_TOKEN", canary)
+    monkeypatch.setattr(settings, "NVIDIA_API_KEY", "")
+    monkeypatch.setattr(settings, "QSTASH_TOKEN", canary)
+    monkeypatch.setattr(settings, "QSTASH_CURRENT_SIGNING_KEY", canary)
+    monkeypatch.setattr(settings, "QSTASH_NEXT_SIGNING_KEY", canary)
+    monkeypatch.setattr(server, "get_store", lambda: HealthyUpstash())
+
+    response = client.get("/api/health")
+
+    assert response.status_code == 503
+    serialized = response.text
+    assert "NVIDIA_API_KEY" in serialized
+    assert canary not in serialized

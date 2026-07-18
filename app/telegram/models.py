@@ -11,6 +11,11 @@ from dataclasses import dataclass
 from typing import Optional
 
 MAX_HISTORY_TEXT_CHARS = 4096
+MAX_USERNAME_CHARS = 64
+MAX_NAME_CHARS = 256
+MAX_ENTITIES = 100
+MAX_ENTITY_TYPE_CHARS = 32
+MAX_ENTITY_UTF16_UNITS = MAX_HISTORY_TEXT_CHARS * 2
 
 
 @dataclass
@@ -35,9 +40,15 @@ class IncomingMessage:
 
 
 def _full_name(user: dict) -> str:
-    parts = [user.get("first_name"), user.get("last_name")]
-    name = " ".join(p for p in parts if p)
-    return name or (user.get("username") or "unknown")
+    parts = [
+        value.strip()
+        for value in (user.get("first_name"), user.get("last_name"))
+        if isinstance(value, str) and value.strip()
+    ]
+    name = " ".join(parts)
+    if not name:
+        name = _bounded_username(user.get("username")) or "unknown"
+    return name[:MAX_NAME_CHARS]
 
 
 def _as_int(value: object) -> Optional[int]:
@@ -50,6 +61,48 @@ def _as_int(value: object) -> Optional[int]:
 def _bounded_text(value: object) -> str:
     """Bound text persisted in Redis even if an upstream payload is malformed."""
     return str(value or "")[:MAX_HISTORY_TEXT_CHARS]
+
+
+def _bounded_username(value: object) -> Optional[str]:
+    """Normalize the Telegram username representation before persistence."""
+    if not isinstance(value, str):
+        return None
+    username = value.strip().lstrip("@")[:MAX_USERNAME_CHARS]
+    return username or None
+
+
+def _normalized_entities(value: object) -> list[dict]:
+    """Keep only the bounded entity fields used by routing and snapshots."""
+    if not isinstance(value, list):
+        return []
+
+    normalized: list[dict] = []
+    for item in value[:MAX_ENTITIES]:
+        if not isinstance(item, dict):
+            continue
+        entity_type = item.get("type")
+        offset = _as_int(item.get("offset"))
+        length = _as_int(item.get("length"))
+        if (
+            not isinstance(entity_type, str)
+            or not entity_type
+            or offset is None
+            or length is None
+            or offset < 0
+            or length <= 0
+            or offset > MAX_ENTITY_UTF16_UNITS
+            or length > MAX_ENTITY_UTF16_UNITS
+            or offset + length > MAX_ENTITY_UTF16_UNITS
+        ):
+            continue
+        normalized.append(
+            {
+                "type": entity_type[:MAX_ENTITY_TYPE_CHARS],
+                "offset": offset,
+                "length": length,
+            }
+        )
+    return normalized
 
 
 def parse_update(update: dict) -> Optional[IncomingMessage]:
@@ -96,9 +149,9 @@ def parse_update(update: dict) -> Optional[IncomingMessage]:
     text = message.get("text") if has_text else message.get("caption")
     reply_text = reply.get("text") or reply.get("caption")
 
-    entities = message.get("entities") if has_text else message.get("caption_entities")
-    if not isinstance(entities, list):
-        entities = []
+    entities = _normalized_entities(
+        message.get("entities") if has_text else message.get("caption_entities")
+    )
 
     return IncomingMessage(
         update_id=update_id,
@@ -106,13 +159,13 @@ def parse_update(update: dict) -> Optional[IncomingMessage]:
         message_id=message_id,
         text=_bounded_text(text),
         user_id=_as_int(user.get("id")),
-        username=user.get("username"),
+        username=_bounded_username(user.get("username")),
         name=_full_name(user),
-        is_bot=bool(user.get("is_bot", False)),
+        is_bot=user.get("is_bot") is True,
         is_edited=is_edited,
         date=message_date,
         edit_date=edit_date,
-        reply_to_bot=bool(reply_from.get("is_bot", False)),
+        reply_to_bot=reply_from.get("is_bot") is True,
         reply_to_message_id=_as_int(reply.get("message_id")),
         reply_to_user_id=_as_int(reply_from.get("id")),
         reply_to_text=_bounded_text(reply_text) if reply_text is not None else None,

@@ -1,121 +1,98 @@
-# Техническое задание (PRD): Умный Telegram-бот с Web UI админкой и динамическим поведением на базе LLM
+# Product Requirements: Smart Telegram Bot with a Web Admin Panel and Dynamic LLM Behaviour
 
-## 1. Обзор проекта (Executive Summary)
+## 1. Overview
 
-Необходимо разработать Telegram-бота для закрытого группового чата (до 10–15 человек) с веб-интерфейсом управления (Admin Panel UI). Главная фишка бота — динамически изменяемое поведение на основе LLM (NVIDIA NIM API), гибкая система правил для отдельных пользователей, реакция на ключевые слова, анализ контекста переписки для разрешения споров и управление тоном общения.
+Build a Telegram bot for one private group of roughly 10–15 people, with a web
+admin panel. Its key capability is dynamically configurable LLM behaviour via
+NVIDIA NIM: flexible per-user rules, keyword triggers, conversation-context
+analysis for disputes, and tone management.
 
-Проект должен быть оптимизирован для развертывания в бесплатной экосистеме (Serverless на Vercel + бесплатный тариф БД + бесплатные лимиты LLM API).
+The project should fit a low-cost stack: Vercel serverless functions, a free
+database tier, and available LLM quotas.
 
----
+## 2. Architecture and technology stack
 
-## 2. Архитектура и стек технологий (Tech Stack)
+- **Runtime and hosting:** Vercel Serverless Functions with webhooks, never long
+  polling.
+- **Language and framework:** Python with FastAPI in `/api`, optimised for
+  serverless execution.
+- **LLM provider:** NVIDIA NIM API (`https://integrate.api.nvidia.com/v1`).
+- **Models:** `deepseek-ai/deepseek-v4-flash` for ordinary replies and
+  `deepseek-ai/deepseek-v4-pro` for complex reasoning and disputes. Qwen is not
+  used.
+- **Database:** a serverless-safe persistent store for settings, admins, rules,
+  and chat history. The selected stack is Upstash Redis.
+- **Web admin:** a lightweight UI on the same Vercel domain, protected by
+  Telegram OIDC Authorization Code Flow and a server-side session.
 
-* **Runtime / Хостинг:** Vercel (Serverless Functions / Webhook architecture). Бот должен работать через Webhook, а не Long Polling.
-* **Язык программирования:** Python (FastAPI / `pyTelegramBotAPI` / `aiogram` в папке `/api`) или Node.js / TypeScript (`grammY` / `Telegraf`), оптимизированный под Serverless.
-* **LLM Провайдер:** NVIDIA NIM API (`[https://integrate.api.nvidia.com/v1](https://integrate.api.nvidia.com/v1)`, полная совместимость с OpenAI SDK).
-* **Модели:** `deepseek-ai/deepseek-v4-flash` для обычных ответов и `deepseek-ai/deepseek-v4-pro` для сложных рассуждений и разрешения споров. Qwen не используется.
-* **База данных (Обязательно для Serverless):** Поскольку Vercel stateless (не хранит состояние между запросами), необходима легкая бесплатная БД для сохранения настроек, админов, правил поведей и истории сообщений. Рекомендуемый стек: **Upstash Redis** (для кэша истории сообщений) или **Supabase (PostgreSQL) / Vercel Postgres / Turso (SQLite)**.
-* **Web UI (Админка):** Легковесный фронтенд (React / Next.js / Vue или HTML+Tailwind с FastAPI), развернутый на том же домене Vercel и защищённый Telegram OIDC Authorization Code Flow с серверной сессией.
+## 3. Roles and permissions
 
----
+1. **Super admin / owner**
+   - Has full access to the web admin panel.
+   - Can designate bot admins by Telegram ID or observed `@username`.
+   - Configures global rules and triggers.
+2. **Assigned admins**
+   - Are group members granted bot-admin access in the UI.
+   - Can change the global or current-chat tone from Telegram or the UI.
+   - Can invoke dispute commands and manage trigger rules.
+3. **Users**
+   - Ask the bot questions with a mention or a reply to the bot.
+   - May be subject to administrator-configured personal rules.
 
-## 3. Ролевая модель и система прав
+## 4. Core features
 
-1. **Главный администратор (Super Admin / Владелец):**
-* Имеет полный доступ к UI админке.
-* Может назначать других пользователей «Администраторами бота» через UI (по Telegram ID или `@username`).
-* Настраивает глобальные правила и триггеры.
+### Web admin panel
 
+- Manage users and lists. Add a user by numeric Telegram ID after membership
+  verification, or by `@username` only after the bot has observed that username
+  in the allowed group. The Bot API cannot safely resolve arbitrary usernames.
+- Grant and revoke bot-admin rights.
+- Build text rules for word roots, words, and phrases, plus per-user list-based
+  policies such as a sarcastic-response list or an ignore list.
+- Select tone presets: scientist, street, sarcastic robot, neutral assistant,
+  and serious. Support a custom system-prompt override.
 
-2. **Назначенные администраторы (Admins):**
-* Пользователи чата, получившие права админа в UI.
-* Могут менять глобальный или текущий «тон общения» бота прямо из чата или через UI.
-* Могут вызывать команды разрешения споров и управлять правилами триггеров.
+### Telegram processing
 
+- Keep the latest 20–30 messages with author, text, and timestamp in persistent
+  storage so the model can understand group context.
+- Resolve disputes through `/judge`, `/dispute`, or a bot mention containing
+  an English judge intent such as “judge us” or “who is right?”. The bot analyses
+  the latest N messages, identifies reasoning errors, fact-checks when possible,
+  and gives a fair verdict in the selected tone.
+- Reply when mentioned (`@bot_name <question>`) or when a user replies to a
+  message sent by this bot.
+- Allow admins to change tone from chat, for example `/tone sarcastic` or
+  `/set_mode serious`.
 
-3. **Обычные пользователи (Users):**
-* Общаются в чате, тегают бота для вопросов.
-* Подпадают под действие персональных правил (если они внесены админом в специальные списки).
+## 5. LLM prompt construction
 
+For each response, build the effective prompt from these layers:
 
+1. **Base layer:** the active tone from admin settings.
+2. **Actor layer:** the verified caller identity, username as untrusted data,
+   and computed admin status.
+3. **Personal-policy layer:** administrator-authored list policies matching the
+   caller.
+4. **Trigger layer:** administrator-authored keyword/phrase rules matching the
+   message.
+5. **Dispute layer:** a dedicated template and raw recent-message transcript for
+   a judge request.
 
----
+## 6. Implementation request
 
-## 4. Функциональные требования (Core Features)
+The project must:
 
-### Модуль 1: Web UI (Админ-панель)
+1. Define the Vercel-safe architecture and Redis schema for users, lists, rules,
+   tone settings, and chat logs.
+2. Break the work into a small number of independently testable end-to-end
+   tickets.
+3. Use a Vercel-compatible Python repository structure in which the web UI and
+   bot API live together.
+4. Implement the webhook, NVIDIA NIM client and prompt builder, history buffer,
+   and admin CRUD endpoints in their assigned tickets.
 
-Интерфейс для настройки правил без изменения кода. Должен включать следующие разделы:
-
-* **Управление пользователями и списками (User Mapping):**
-* Добавление пользователей по Telegram ID или `@username` в кастомные списки (грубый/агрессивный лист, любимчики, игнор-лист и т.д.). Telegram ID работает после проверки membership; `@username` разрешается только если пользователь уже наблюдался ботом в разрешённой группе (Bot API не умеет безопасно искать произвольный username).
-* Назначение прав «Администратор бота» конкретным юзерам.
-
-
-* **Конструктор правил и триггеров (Rule Engine):**
-* *Текстовые триггеры:* Настройка реакций на корни слов или фразы. (Пример: При обнаружении слова с корнем «бред» в сообщении любого пользователя бот должен вмешаться и аргументированно ответить, что это не бред).
-* *Персональные триггеры:* Настройка тона под конкретного человека. (Пример: Если пишет юзер `@user_x` из списка «Агрессивный ответ», системный промпт LLM переключается в режим жесткого сарказма или троллинга именно для него).
-
-
-* **Настройка глобального тона (Tone Management):**
-* Выбор пресетов поведения (Душный научный сотрудник, Пацан с района, Саркастичный робот, Нейтральный помощник).
-* Поле для кастомного системного промпта (System Prompt Override).
-
-
-
-### Модуль 2: Telegram-бот и обработка сообщений
-
-* **Логирование контекста (Chat History Buffer):**
-* Бот должен сохранять последние 20–30 сообщений чата (Автор + Текст + Таймстамп) в базу данных или Redis. Это необходимо для того, чтобы LLM «понимала», о чем идет речь в группе, даже если не отвечала на каждое сообщение.
-
-
-* **Разрешение споров (Fair Dispute Resolution):**
-* По команде (например, `/judge`, `/спор` или при теге бота со словами «рассуди нас», «кто прав?») бот извлекает из БД последние N сообщений чата.
-* LLM анализирует аргументы сторон в контексте переписки, выявляет логические ошибки, проверяет факты и выдает честный, объективный (но выдержанный в выбранном тоне) вердикт, кто из участников спора прав.
-
-
-* **Реакция на тег и прямые вопросы (@Mention / Direct Q&A):**
-* Если пользователь тегает бота (`@bot_name <вопрос>`) или отвечает на сообщение бота (Reply), бот отправляет запрос в LLM с учетом текущего глобального тона и отвечает на вопрос.
-
-
-* **Переключение тона из чата:**
-* Назначенные администраторы должны иметь возможность сменить тон бота прямо в чате командой (например, `/tone sarcastic` или `/set_mode serious`).
-
-
-
----
-
-## 5. Интеграция с LLM и структура промптов
-
-При генерации ответа бот должен динамически собирать **System Prompt** по следующему алгоритму:
-
-1. **Базовый слой:** Основной характер бота (из настроек тона в админке).
-2. **Контекстный слой:** Добавление информации о том, кто именно сейчас обратился к боту (Имя, Username, статус админа).
-3. **Слой персональных правил:** Проверка по БД, находится ли автор сообщения в особых списках (например, список «Отвечать агрессивно»). Если да — в системный промпт инжектируется жесткое правило: *"Ответь этому пользователю с максимальным сарказмом/агрессией"*.
-4. **Слой триггеров:** Проверка текста на ключевые слова (например, корень «бред»). Если найден триггер, в инструкцию добавляется: *"Пользователь использовал слово 'бред'. Твоя обязательная задача — доказать, что сказанное ранее не является бредом"*.
-5. **Промпт для разрешения споров:** Специальный шаблон, куда передается сырой массив последних сообщений из буфера БД с инструкцией проанализировать диалог и вынести вердикт.
-
----
-
-## 6. Задача для ИИ-агента разработчика (Action Plan for Coding Agent)
-
-*На основе этого ТЗ тебе необходимо выполнить следующие шаги:*
-
-1. **Спроектировать архитектуру и схему БД:**
-* Предложить оптимальную бесплатную БД под Vercel (Supabase / Upstash).
-* Написать схему таблиц/коллекций (Users, Lists, Rules, ToneSettings, ChatLogs).
-
-
-2. **Разбить проект на эпики и тикеты (Step-by-Step Implementation Plan):**
-* Создать подробный план реализации по задачам (от инициализации репозитория и настройки Webhook до создания API админки и подключения LLM).
-
-
-3. **Выбрать фреймворк и структуру директорий:**
-* Предложить структуру проекта под Vercel Serverless (чтобы UI админки и API бота жили в одном монорепозитории).
-
-
-4. **Написать код базовых модулей:**
-* Реализовать Webhook-хендлер для Telegram.
-* Реализовать клиент для NVIDIA NIM API с поддержкой OpenAI SDK и динамической сборкой System Prompt.
-* Реализовать буфер сообщений для функции разрешения споров.
-* Написать базовые эндпоинты для Web UI админки (CRUD для правил и списков юзеров).
+The original implementation preference is Python and LangChain `ChatNVIDIA`.
+The current model and non-thinking transport contract is specified in
+`tickets/00-ARCHITECTURE.md`; it supersedes any historical code fragment in
+`PROMPT.md`.
