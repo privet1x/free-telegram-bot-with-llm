@@ -1,273 +1,274 @@
-# TICKET-05 — Web Admin: Telegram OIDC, CRUD/UI и privacy controls
+# TICKET-05 — Web Admin: Telegram OIDC, CRUD/UI, and Privacy Controls
 
-**Размер:** XL · **Зависит от:** 04 (включает данные 03 и judge settings) ·
-**Разблокирует:** —
-**Общий контракт:** `00-ARCHITECTURE.md` (§3, §4, §8)
+**Size:** XL · **Depends on:** 04, including Ticket 03 data and judge settings
+**Unblocks:** —
+**Shared contract:** 00-ARCHITECTURE.md sections 3, 4, and 8
 
-## Цель
+**Status:** Partial local implementation only. Authentication foundations and
+read APIs exist; full CRUD/privacy purge, group-membership checks, and complete
+admin UI remain to be implemented before this ticket can pass its review gate.
 
-Дать super-admin и назначенным admins безопасный интерфейс управления теми же
-tone/list/rule сущностями Redis, которые уже исполняет бот. Вход — современный
-Telegram **OIDC Authorization Code Flow** с PKCE/state, затем собственная
-короткая серверная сессия с мгновенной проверкой актуальных прав.
+## Goal
 
-UI статичный, поэтому секретные env в него не встраиваются. Безопасные значения
-он получает через `/api/public/config`.
+Give the super-admin and assigned admins a safe UI for the same tone, list, and
+rule entities already used by the bot. Authentication uses modern Telegram OIDC
+Authorization Code Flow with PKCE/state, followed by a short custom server-side
+session with immediate role validation.
 
-## Решение по авторизации
+The UI is static and never embeds secret environment values. It obtains only
+safe public values through /api/public/config.
 
-Используется current Telegram OIDC, не legacy iframe Login Widget/HMAC flow.
+## Authentication design
 
-1. В BotFather → Bot Settings → Web Login зарегистрировать стабильный Vercel
-   origin и точный callback
-   `{PUBLIC_BASE_URL}/api/auth/telegram/callback`; получить Client ID/Secret.
-2. `GET /api/auth/telegram/start` создаёт криптографически случайные `state`,
-   `nonce`, PKCE verifier/challenge (S256) и отдельный browser-binding handle.
-   One-time transaction по hash(state) хранит hash(handle), nonce, verifier и
-   exact redirect URI с TTL 10 минут. Raw handle попадает только в cookie
-   `__Host-kulajaj_oidc` (`HttpOnly; Secure; SameSite=Lax; Path=/`, Max-Age 600,
-   без Domain), а не в URL/Redis/log.
-3. Callback атомарно consume-ит transaction **только** если hash
-   presented pre-auth cookie constant-time совпал с binding в этом state и exact
-   redirect URI совпал. Missing/wrong cookie не создаёт сессию и не consume-ит
-   чужую valid transaction; cookie очищается на любом завершающем callback
-   response. Browser `Origin` для cross-site OAuth redirect не считается
-   обязательным. Затем backend server-side обменивает code с PKCE и
-   Client Secret.
-4. ID token проверяется по Telegram JWKS: разрешённый algorithm (default RS256),
-   signature, `iss=https://oauth.telegram.org`, `aud=TELEGRAM_OIDC_CLIENT_ID`,
-   `exp`, `iat`, `nonce`. Canonical Bot API/admin `user_id` берётся из
-   проверенного numeric claim `id`; OIDC `sub` также валидируется, но не
-   подставляется вместо Telegram `id`.
-5. Valid Telegram identity ещё не даёт доступ: ID должен быть
-   `SUPER_ADMIN_ID` или находиться в Redis `admins`.
-6. После проверки создаются signed JWT **и** `session:{jti}` в Redis. Cookie —
-   `__Host-kulajaj_session`, HttpOnly, Secure, SameSite=Lax, Path=/, без Domain.
+Use current Telegram OIDC, not the legacy iframe Login Widget/HMAC flow.
 
-Frontend не получает Telegram Client Secret, bot token, session secret, Redis
-или provider keys.
+1. In BotFather → Bot Settings → Web Login, register a stable Vercel origin and
+   exact callback {PUBLIC_BASE_URL}/api/auth/telegram/callback. Obtain client ID
+   and client secret.
+2. GET /api/auth/telegram/start creates cryptographically random state, nonce,
+   PKCE verifier/challenge using S256, and an independent browser-binding handle.
+   A one-time state-hash transaction stores handle hash, nonce, verifier, and
+   exact redirect URI for 10 minutes. The raw handle exists only in the
+   __Host-kulajaj_oidc cookie: HttpOnly, Secure, SameSite=Lax, Path=/,
+   Max-Age=600, and no Domain. It never enters a URL, Redis value, or log.
+3. The callback atomically consumes a transaction only when the hash of the
+   presented pre-auth cookie constant-time matches its state binding and the
+   redirect URI exactly matches. A missing/wrong cookie creates no session and
+   does not consume someone else's transaction. Clear the cookie on every
+   terminal callback response. Browser Origin is not mandatory for a cross-site
+   OAuth redirect. Backend exchanges code with PKCE and client secret.
+4. Validate the ID token through Telegram JWKS: allowed algorithm (default RS256),
+   signature, issuer https://oauth.telegram.org, audience
+   TELEGRAM_OIDC_CLIENT_ID, expiry, issued-at, and nonce. Canonical Bot API/admin
+   user_id comes from the verified numeric id claim. Validate OIDC sub too, but
+   never substitute it for Telegram id.
+5. A valid Telegram identity alone gives no access: it must equal SUPER_ADMIN_ID
+   or belong to Redis admins.
+6. Create a signed JWT and Redis session:<jti>. Store it in
+   __Host-kulajaj_session with HttpOnly, Secure, SameSite=Lax, Path=/, and no
+   Domain.
 
-## Сессия и немедленный отзыв прав
+Never expose Telegram client secret, bot token, session secret, Redis credentials,
+or provider keys to frontend JavaScript.
 
-- Своя session JWT подписывается только `HS256` высокоэнтропийным
-  `SESSION_SECRET`; decode всегда передаёт fixed `algorithms=["HS256"]` и не
-  выбирает algorithm из token header. OIDC ID-token validation остаётся
-  отдельным RS256/JWKS contract.
-- Session JWT claims: `iss`, `aud`, canonical decimal-string `sub`, numeric
-  `tg_user_id`, `jti`, `iat`, `nbf`, `exp` (не более 8 часов), `admin_version`.
-  `sub` обязан быть равен `str(tg_user_id)`; bool, float, leading sign/zeroes и
-  несовпадение claims отклоняются.
-- Каждый `require_admin` проверяет signature/claims, существование
-  `session:{jti}`, current `adminver:{uid}` и **текущий** `is_admin(uid)` в Redis.
-  Одной проверки JWT недостаточно.
-- Назначенный admin должен быть участником разрешённой группы: это проверяется
-  через `getChatMember` при назначении и login, затем перепроверяется для
-  активной сессии с cache не дольше 5 минут. `left`/`kicked` закрывает доступ при
-  следующей проверке; явный revoke роли действует немедленно. Production setup
-  для гарантии `getChatMember` делает бота group admin.
-- Remove admin увеличивает `adminver`, после чего все его старые requests сразу
-  получают 401/403. Super-admin из env удалить нельзя.
-- Logout удаляет server session и истекает cookie. Просроченные session records
-  уходят по TTL.
-- JWKS кэшируется с bounded TTL; неизвестный `kid` вызывает один безопасный
-  refresh. Token/claims целиком не логируются.
+## Sessions and immediate revocation
+
+- Sign custom session JWT only with HS256 and a high-entropy SESSION_SECRET.
+  Decode with fixed algorithms=["HS256"]; never pick an algorithm from the token
+  header. Keep OIDC RS256/JWKS validation separate.
+- JWT claims are issuer, audience, canonical decimal-string sub, numeric
+  tg_user_id, jti, issued-at, not-before, expiry (maximum eight hours), and
+  admin_version. sub must equal str(tg_user_id). Reject bool, float, sign/leading
+  zero forms, and mismatched claims.
+- Every require_admin request verifies signature/claims, session:<jti>, current
+  adminver:<uid>, and current is_admin(uid) in Redis. JWT alone is insufficient.
+- An assigned admin must be a member of the allowed group. Check with
+  getChatMember during assignment and login, then recheck active sessions with a
+  cache no longer than five minutes. left/kicked prevents access at next check.
+  Making the bot a group admin is required in production for reliable checks.
+- Removing an admin increments adminver, invalidating active requests immediately.
+  SUPER_ADMIN_ID from environment cannot be removed.
+- Logout deletes the server record and expires cookie. Session records expire by
+  TTL. JWKS has a bounded cache; an unknown kid triggers one safe refresh.
+  Never log full token or claims.
 
 ## Backend API
 
-### Config/dependencies
+### Configuration and dependencies
 
-- [ ] Добавить `TELEGRAM_OIDC_CLIENT_ID`, `TELEGRAM_OIDC_CLIENT_SECRET` в
-  settings/`.env.example`, pin `PyJWT[crypto]`; secret остаётся только server-side.
-- [ ] Production validation требует exact HTTPS `PUBLIC_BASE_URL`, OIDC values,
-  положительный `SUPER_ADMIN_ID` и случайный `SESSION_SECRET` минимум 32
-  bytes. Без env super-admin production не стартует: это единственный
-  bootstrap, пароля/bootstrap endpoint нет. Health сообщает только названия
-  отсутствующих dependencies, не значения.
+- [ ] Add TELEGRAM_OIDC_CLIENT_ID and TELEGRAM_OIDC_CLIENT_SECRET to settings and
+  .env.example. Pin PyJWT[crypto]. Keep the secret server-side.
+- [ ] Production validation requires exact HTTPS PUBLIC_BASE_URL, OIDC values, a
+  positive SUPER_ADMIN_ID, and a random SESSION_SECRET of at least 32 bytes.
+  Without an environment super-admin, production does not start: there is no
+  password/bootstrap endpoint. Health reports dependency names only.
 
-### Public/auth
+### Public and authentication endpoints
 
-- [ ] `GET /api/public/config` возвращает только:
+- [ ] GET /api/public/config returns only:
 
-  ```json
-  {"telegram_bot_username":"bot_name","oidc_client_id":"123..."}
-  ```
+~~~json
+{"telegram_bot_username":"bot_name","oidc_client_id":"123..."}
+~~~
 
-- [ ] `GET /api/auth/telegram/start` и
-  `GET /api/auth/telegram/callback` реализуют flow выше со scope только
-  `openid profile` (phone/write для админки не запрашиваются).
-- [ ] `POST /api/auth/logout` требует same-origin + CSRF, удаляет сессию.
-- [ ] `GET /api/admin/me` возвращает safe profile, роль и CSRF token текущей
-  сессии.
+- [ ] GET /api/auth/telegram/start and callback implement the above with scope
+  only openid profile. Do not request phone or write permissions.
+- [ ] POST /api/auth/logout requires same-origin and CSRF validation and deletes
+  the session.
+- [ ] GET /api/admin/me returns safe profile, role, and CSRF token.
 
-### Observed users и username resolution
+### Observed users and username resolution
 
-- [ ] `GET /api/admin/users?q=` делает bounded exact lookup в observed directory
-  Ticket 01 по numeric ID или normalized current username. Поиск по display name
-  не обещается без отдельного индекса.
-- [ ] Ввод numeric Telegram ID разрешён, даже если профиль ещё не observed.
-- [ ] `@username` резолвится **только** через `username:{casefold_without_at}`.
-  Bot API не умеет разрешать произвольный username. Для неизвестного username
-  API возвращает 422 с подсказкой: пользователь должен сначала написать в
-  разрешённом чате либо admin вводит numeric ID.
-- [ ] Переименование использует только current index: старый alias не назначает
-  права другому человеку и не резолвится после корректного upsert.
-- [ ] `DELETE /api/admin/users/{id}` (super-admin) collision-safe удаляет profile
-  и его current username key, membership из lists и назначенную admin-role с
-  increment `adminver` (super-admin удалить нельзя). Опция
-  `purge_messages=true` атомарно удаляет его authored history records, очищает
-  `reply_to.user_id/text` в чужих records и отменяет/удаляет indexed jobs,
-  snapshot которых содержит пользователя. До удаления job purge берёт из его
-  delivery checkpoints все outbound bot `message_id` и удаляет эти records из
-  history: так производный ответ, который мог цитировать удаляемого
-  участника, тоже исчезает. Если job уже истёк и provenance нет, UI честно
-  предлагает full-chat purge.
-  Новое сообщение пользователя создаст profile снова.
+- [ ] GET /api/admin/users?q= does a bounded exact lookup in the Ticket 01
+  observed directory by numeric ID or normalized current username. Do not promise
+  display-name search without an index.
+- [ ] Numeric Telegram ID input is allowed even before a profile is observed.
+- [ ] Resolve @username only through username:<casefold_without_at>. The Bot API
+  cannot resolve arbitrary usernames. Unknown username returns 422 explaining
+  that the person must first message in the allowed group or be entered by
+  numeric ID.
+- [ ] Rename uses current index only. A stale alias neither resolves nor grants a
+  role to another person.
+- [ ] DELETE /api/admin/users/{id}, super-admin only, collision-safely removes
+  profile, current username key, list memberships, and assigned admin role while
+  incrementing adminver. SUPER_ADMIN_ID cannot be deleted.
+- [ ] With purge_messages=true, atomically remove authored history, clear
+  reply_to.user_id/text in other records, and cancel/delete indexed jobs whose
+  snapshots contain the user. Use delivery checkpoints to remove indexed outbound
+  bot history records that could quote the deleted person. If job provenance has
+  expired, offer a full-chat purge honestly. A future message observes the
+  profile again.
 
-### CRUD (все требуют current admin)
+### CRUD endpoints
 
-- [ ] `GET/POST/DELETE /api/admin/admins` — только super-admin на mutation;
-  add по current observed `@username` или numeric Telegram ID. Для numeric ID
-  observed profile не обязателен: backend вызывает `getChatMember` только для
-  configured allowed group, требует current member/admin/creator status и может
-  seed-ит observed profile из проверенного Bot API `result.user`. Так PRD-контракт
-  «по ID или @username» работает без снижения защиты chat logs. Unknown
-  username по-прежнему 422, а numeric non-member/left/kicked — отказ. Remove
-  увеличивает `adminver`.
-- [ ] `GET/POST/PUT/DELETE /api/admin/lists` + add/remove membership. Backend
-  соблюдает canonical `title`, `enabled`, `priority`, `applies_to`, `injected_prompt`
-  и length limits, защищает reserved `ignore` от удаления/rename; UI/API дают
-  создать/переименовать custom list и редактировать каждое из этих policy fields.
-- [ ] `GET/POST/PUT/DELETE /api/admin/rules` по canonical Ticket 03 schema:
-  `priority`, `scope`, `match.type/value`, `instruction`, `stop_processing`.
-  IDs immutable; update/delete не оставляет orphan index.
-- [ ] `GET /api/admin/tone` возвращает `global`, `chat_override` и `effective` config;
-  `PUT /api/admin/tone` принимает explicit `scope="global"|"chat"` и `tone_mode`, canonical preset,
-  `custom_system_prompt`, `judge_default_n` (`5..30`); `DELETE /api/admin/tone/override`
-  атомарно очищает chat override. Update сразу применяется к
-  следующим jobs. API принимает только canonical
-  `neutral|serious|scientist|street|sarcastic_robot`; chat-only alias
-  `sarcastic` сюда не попадает.
-- [ ] `GET /api/admin/logs` читает bounded history только allowed chat.
-  `DELETE /api/admin/logs` (super-admin + повторное подтверждение UI) полностью
-  отменяет non-terminal jobs, удаляет indexed private job snapshots/answers и
-  purges history; arbitrary `chat_id` не принимается. QStash callback на уже
-  удалённый/cancelled job отвечает terminal `2xx` без side effect.
-- [ ] Все mutation API используют typed JSON schema, reject unknown fields,
-  request-size limits и понятные 4xx; никаких partial writes при validation error.
+All endpoints require current admin unless stated otherwise.
 
-## CSRF, XSS и HTTP security
+- [ ] GET/POST/DELETE /api/admin/admins. Only super-admin can mutate. Add through
+  observed current @username or numeric Telegram ID.
+- [ ] Numeric-ID admin assignment does not require an observed profile. Backend
+  calls getChatMember for the configured allowed group, requires current
+  member/admin/creator state, and may seed profile from verified result.user.
+  Unknown username remains 422; numeric non-member/left/kicked is refused.
+  Removing an admin increments adminver.
+- [ ] GET/POST/PUT/DELETE /api/admin/lists plus membership add/remove. Enforce
+  title, enabled, priority, applies_to, injected_prompt, length limits, and
+  reserved ignore protection. UI/API can create/rename a custom list and edit
+  every policy field.
+- [ ] GET/POST/PUT/DELETE /api/admin/rules with Ticket 03 canonical priority,
+  scope, match.type/value, instruction, and stop_processing. IDs are immutable.
+  Update/delete must not leave orphan indexes.
+- [ ] GET /api/admin/tone returns global, chat_override, and effective config.
+  PUT accepts explicit scope="global" or "chat", tone_mode, canonical preset,
+  custom_system_prompt, and judge_default_n in [5,30]. DELETE
+  /api/admin/tone/override atomically clears chat override. API accepts only
+  neutral, serious, scientist, street, and sarcastic_robot; command-only
+  sarcastic alias never enters API/Redis.
+- [ ] GET /api/admin/logs reads bounded history only for the allowed chat.
+  DELETE /api/admin/logs requires super-admin plus repeated UI confirmation,
+  cancels non-terminal jobs, removes indexed private job snapshots/answers, and
+  purges history. It accepts no arbitrary chat_id. QStash callback for a
+  deleted/cancelled job returns terminal 2xx without side effects.
+- [ ] Every mutation uses typed JSON schema, rejects unknown fields, enforces
+  request-size limits, returns clear 4xx, and makes no partial write on
+  validation failure.
 
-- Unsafe methods требуют одновременно:
-  - same-origin `Origin` (или строго проверенный `Referer` fallback);
-  - `X-CSRF-Token`, constant-time сравнимый с token server session.
-- CORS не открывается внешним origins; auth endpoints имеют rate limit.
-- UI никогда не рендерит logs, names, usernames, rule text, custom prompt или
-  error через `innerHTML`. Только `textContent`/DOM APIs; URL attributes проходят
-  allowlist.
-- Нет inline JS/event handlers. `app.js` подключён `defer`, CSS локальный.
-- Vercel headers включают CSP примерно
-  `default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self';
-  img-src 'self' data: https:; frame-ancestors 'none'; base-uri 'self';
-  form-action 'self' https://oauth.telegram.org`, плюс `nosniff`, строгий
-  Referrer-Policy и HSTS на production.
-- Ошибки API не возвращают stack trace/secrets. Для state-changing ответов
-  `Cache-Control: no-store`; auth/admin pages не кэшируют приватные JSON.
+## CSRF, XSS, and HTTP security
 
-## Frontend (`public/`)
+- Every unsafe method requires both a same-origin Origin (or strict Referer
+  fallback) and X-CSRF-Token compared constant-time to server-session data.
+- Do not allow cross-origin CORS. Rate-limit auth routes.
+- Never render logs, names, usernames, rule text, custom prompt, or errors with
+  innerHTML. Use textContent/DOM APIs only; allowlist URL attributes.
+- No inline JavaScript or event handlers. Load app.js with defer and local CSS.
+- Vercel headers include CSP similar to:
 
-- [ ] Стартовый экран fetch-ит `/api/public/config`, показывает имя бота и кнопку
-  «Войти через Telegram», ведущую на `/api/auth/telegram/start`.
-- [ ] После login `/api/admin/me` определяет роль; 401 возвращает на login screen.
-- [ ] Разделы:
-  - **Пользователи и списки:** observed search, ввод ID/username, memberships,
-    создание/редактирование title/enabled/priority/applies_to/`injected_prompt`,
-    назначение admin (только super-admin);
-  - **Rules:** match type/value, scope, priority, instruction, stop flag,
-    deterministic preview order;
-  - **Tone:** canonical presets, custom mode/prompt, `judge_default_n`, visible
-    global/chat/effective value, explicit global/current switch и clear override;
-  - **Logs:** последние записи, edit/reply/bot markers, purge action;
-  - **Privacy:** retention values, copyable participant notice, delete observed
-    profile и purge history.
-- [ ] У каждой mutation есть loading/error/success state; destructive actions
-  требуют явного подтверждения и после успеха перечитывают server state.
-- [ ] 401/403 различаются: expired/revoked session предлагает перелогиниться,
-  недостаточная роль не скрывается под generic network error.
+~~~text
+default-src 'self';
+script-src 'self';
+style-src 'self';
+connect-src 'self';
+img-src 'self' data: https:;
+frame-ancestors 'none';
+base-uri 'self';
+form-action 'self' https://oauth.telegram.org
+~~~
+
+  Also set nosniff, strict Referrer-Policy, HSTS in production, and
+  Cache-Control: no-store for auth/admin pages and state-changing responses.
+- API errors never return stack traces or secrets.
+
+## Frontend in public/
+
+- [ ] Landing screen fetches /api/public/config, shows bot username, and links
+  “Log in with Telegram” to /api/auth/telegram/start.
+- [ ] After login, /api/admin/me determines role; 401 returns to login.
+- [ ] Implement sections:
+  - **Users and lists:** observed search, numeric ID/username entry, membership,
+    title/enabled/priority/applies_to/injected_prompt editing, super-admin role
+    assignment.
+  - **Rules:** match type/value, scope, priority, instruction, stop flag, and
+    deterministic preview order.
+  - **Tone:** canonical presets, custom prompt/mode, judge_default_n, visible
+    global/chat/effective values, explicit global/current switch, and clear
+    override.
+  - **Logs:** recent records, edit/reply/bot markers, and purge action.
+  - **Privacy:** retention values, copyable participant notice, observed-profile
+    deletion, and history purge.
+- [ ] Each mutation has loading/error/success state. Destructive actions require
+  explicit confirmation and reread server state after success.
+- [ ] Distinguish 401/403: expired/revoked session prompts login; inadequate role
+  is not shown as a generic network error.
 
 ## Privacy lifecycle
 
-- UI показывает фактические значения: максимум 30 сообщений, per-record cutoff и
-  sliding key TTL `HISTORY_RETENTION_SECONDS` (default 30 дней), job snapshots 7
-  дней.
-- До production acceptance admin публикует в группе notice: message/job TTL,
-  что observed profile/list membership живут до удаления, что context
-  отправляется NVIDIA, что Tavily получает только обезличенные factual queries,
-  и как попросить удаление.
-- Purge/delete использует `jobs:chat:*`/`jobs:user:*`, отменяет queued jobs и
-  сразу удаляет private Redis snapshots/history. Worker проверяет cancellation
-  перед provider call и delivery. QStash не содержит transcript; внешний запрос,
-  уже начавшийся до cancellation, и данные, ранее отправленные providers,
-  отозвать нельзя — это честно указано в notice.
-- Full prompts/transcripts не показываются в application logs или error records.
+- Display actual values: maximum 30 messages, per-record cutoff, sliding
+  HISTORY_RETENTION_SECONDS (default 30 days), and seven-day job snapshots.
+- Before production acceptance, an admin publishes a group notice that explains
+  message/job retention, observed profile/list membership retention, NVIDIA
+  context processing, de-identified Tavily queries, and deletion procedure.
+- Purge/delete uses jobs:chat and jobs:user indexes, cancels queued work, and
+  immediately removes private Redis snapshots/history. Workers recheck
+  cancellation before provider calls/delivery. QStash has no transcript. Data
+  already sent to an external provider cannot be recalled; say so in the notice.
+- Do not show full prompts/transcripts in application logs or error records.
 
-## Вне объёма
+## Out of scope
 
-- Multi-chat/tenant роли: продукт намеренно ограничен одним allowed chat.
-- Разрешение произвольного Telegram username через MTProto.
-- SPA framework/build pipeline и legacy Telegram Login Widget.
+- Multi-chat or multi-tenant roles; the product intentionally has one allowed
+  chat.
+- Arbitrary username resolution through MTProto.
+- SPA frameworks/build pipeline and the legacy Telegram Login Widget.
 
-## Автоматические проверки
+## Automated checks
 
-- [ ] OIDC: state one-time/expiry/mismatch, missing/wrong/swapped browser-binding
-  cookie, login-CSRF/session-swapping, atomic consume, PKCE S256, minimal scope, token
-  exchange error, JWKS rotation, wrong alg/signature/iss/aud/nonce, future `iat`,
-  expired token, distinct `sub` и numeric Telegram `id` не перепутаны.
-- [ ] Session: fixed HS256 allowlist, reject `none`/algorithm confusion, canonical
-  string `sub` + matching numeric `tg_user_id`, issuer/audience/expiry/JTI/server
-  record, logout, CSRF/origin, remove-admin immediate revocation, super-admin
-  invariant; missing `SUPER_ADMIN_ID` fails production readiness, empty Redis
-  `admins` still permits configured super-admin login.
-- [ ] Public config не содержит secrets; settings never serialized wholesale.
-- [ ] Username: known/current, unknown 422, rename stale alias, collision-safe
-  cleanup; unseen numeric list member разрешён; unseen numeric **group member**
-  может стать admin после `getChatMember`, non-member запрещён.
+- [ ] OIDC state one-time/expiry/mismatch, missing/wrong/swapped browser-binding
+  cookie, login CSRF/session swapping, atomic consume, PKCE S256, minimal scope,
+  token-exchange errors, JWKS rotation, bad algorithm/signature/issuer/audience/
+  nonce, future issued-at, expiry, and distinct sub versus numeric Telegram id.
+- [ ] Session fixed HS256 allowlist; reject none/algorithm confusion; canonical
+  sub and tg_user_id; issuer/audience/expiry/JTI/server record; logout,
+  CSRF/origin, immediate admin removal, and super-admin invariant.
+- [ ] Missing SUPER_ADMIN_ID fails production readiness. Empty Redis admins still
+  permits configured super-admin login.
+- [ ] Public config excludes secrets. Never serialize all Settings.
+- [ ] Username known/current, unknown 422, rename/stale alias, collision-safe
+  cleanup, unseen numeric list member, unseen numeric group member may become
+  admin through getChatMember, and non-member refusal.
 - [ ] CRUD validation/authorization, allowed-group membership recheck,
-  deterministic entities, reserved ignore, `judge_default_n`, no arbitrary chat
-  ID, user/chat purge cancels indexed jobs, erases snapshots and removes indexed
-  outbound bot history records.
-- [ ] DOM/XSS fixtures with `<script>`, event attributes and malicious URLs;
-  CSP/security/cache headers.
-- [ ] Ticket 01–04 tests, `ruff`, CI Python 3.12 остаются зелёными.
+  deterministic entities, reserved ignore, judge_default_n, no arbitrary chat ID,
+  user/chat purge cancellation, snapshot erase, and outbound history cleanup.
+- [ ] DOM/XSS fixtures with script/event/malicious URL strings, CSP/security/cache
+  headers, and Ticket 01–04 regression suite/Ruff/Python 3.12 CI.
 
-## Критерии приёмки (live E2E)
+## Live E2E acceptance
 
-1. На зарегистрированном стабильном Vercel URL super-admin проходит Telegram
-   OIDC и видит роль; аккаунт вне allowlist после валидного OIDC получает отказ.
-2. Прямой admin API без cookie, без CSRF и с чужим Origin отклоняется. Удалённый
-   admin теряет доступ на следующем request, даже если JWT ещё не истёк.
-3. В UI создать auto rule «бред» → обычное сообщение в группе вызывает бота без
-   redeploy. Изменить priority/stop → порядок меняется детерминированно.
-4. В UI создать custom list с `injected_prompt`, priority и `applies_to`, добавить
-   **observed** `@user_x` → его следующий explicit ответ меняется. Неизвестный username
-   даёт понятный 422; тот же numeric ID можно добавить.
-5. Выбрать global `street`, затем chat `custom` и сохранить prompt →
-   следующие flash replies меняются; clear override возвращает global.
-   `judge_default_n` влияет на `/judge` без redeploy.
-6. Super-admin добавляет второго admin по numeric ID после
-   успешного group-membership check; тот меняет tone, но не управляет admins.
-   После revoke его открытая UI session сразу перестаёт работать.
-7. Logs безопасно показывают malicious-looking text как текст. Purge удаляет
-   history; delete user очищает indexes/memberships. Participant notice
-   опубликован в тестовой группе.
-8. Production response headers соответствуют CSP/security contract, а network
-   trace frontend не содержит bot/OIDC client secrets, provider keys или raw
-   session JWT в JavaScript-readable storage.
+1. On a registered stable Vercel URL, super-admin completes Telegram OIDC and
+   sees the role; a valid Telegram account outside the allowlist is refused.
+2. Admin API requests without cookie, without CSRF, or from another Origin are
+   rejected. A removed admin loses access on the next request even before JWT
+   expiry.
+3. In UI, create automatic nonsense rule; an ordinary group message triggers the
+   bot without redeployment. Change priority/stop and observe deterministic order.
+4. Create a custom list with injected prompt, priority, and applies_to, add an
+   observed @user_x, and see that user's next explicit response change.
+   Unknown username gets clear 422; the same numeric ID can be added.
+5. Choose global street, then chat custom with saved prompt. Subsequent Flash
+   replies change; clear override returns global. judge_default_n affects /judge
+   without redeployment.
+6. Super-admin adds a second admin by numeric ID after group-membership check.
+   That admin changes tone but cannot manage admins. After revoke, the open UI
+   session stops working immediately.
+7. Logs render hostile-looking text as text. Purge removes history; delete user
+   clears indexes/memberships. The participant notice is published in test group.
+8. Production response headers satisfy the CSP/security contract. Frontend trace
+   contains no bot/OIDC client secrets, provider keys, or raw session JWT in
+   JavaScript-readable storage.
 
-## Риски
+## Risks
 
-- Preview domains нужно отдельно регистрировать в BotFather; основной E2E идёт на
-  стабильном домене с точным callback URI.
-- Static UI особенно чувствителен к DOM XSS из chat/rule text — CSP и
-  `textContent` обязательны, не косметичны.
-- JWT без Redis/session/admin recheck не даёт немедленного revoke; обе проверки
-  являются частью acceptance, а не будущим улучшением.
+- Preview domains require separate BotFather registration; primary E2E uses a
+  stable domain and exact callback URI.
+- Static UI is especially exposed to DOM XSS from chat/rule text. CSP and
+  textContent are mandatory safeguards, not cosmetic details.
+- JWT without Redis/session/admin rechecks cannot provide immediate revoke; both
+  checks are part of acceptance.
