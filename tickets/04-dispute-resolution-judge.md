@@ -1,245 +1,240 @@
-# TICKET-04 — Admin-only `/judge`: Pro verdict + grounded fact-check
+# TICKET-04 — Admin-Only Judge, Pro Verdict, and Grounded Fact Checks
 
-**Размер:** L · **Зависит от:** 03 · **Разблокирует:** 05
-**Общий контракт:** `00-ARCHITECTURE.md` (§5–§8)
+**Size:** L · **Depends on:** 03 · **Unblocks:** 05
+**Shared contract:** 00-ARCHITECTURE.md sections 5–8
 
-## Цель
+**Status:** Local implementation and automated checks are complete. Live
+provider/Vercel/Tavily acceptance remains pending authorized deployment.
 
-Реализовать «судью» из PRD: назначенный admin вызывает анализ последних N
-сообщений, бот разбирает позиции и логические ошибки, проверяет до трёх
-проверяемых фактических утверждений через Tavily и выдаёт объективный вердикт в
-активном тоне. Модель для extraction и verdict — строго
-**`deepseek-ai/deepseek-v4-pro`**.
+## Goal
 
-Факт считается проверенным только относительно найденных источников. Модельные
-знания без search evidence не называются проверкой факта. Если поиск недоступен
-или надёжных результатов нет, ответ явно помечает утверждение как непроверенное,
-но всё равно может вынести logic-only verdict.
+Implement the fair dispute resolver from the product requirements. An assigned
+admin requests analysis of the latest N messages. The bot analyses positions and
+reasoning errors, fact-checks up to three externally verifiable claims through
+Tavily, and gives an impartial verdict in the active tone. Claim extraction and
+verdict generation use DeepSeek V4 Pro.
 
-Также дать явный PRD-маршрут для complex reasoning: admin пишет
-`/deep <вопрос>` или `/deep@bot <вопрос>`, что создаёт `kind="deep_reply"` и вызывает
-Pro без Tavily/judge verdict. Это не classifier и не silent cost escalation: обычный
-mention/reply остаётся Flash, Pro выбирается явно.
+A fact is “checked” only relative to supplied search evidence. Model knowledge
+without search evidence must not be described as fact checking. If search is
+unavailable or insufficient, the response explicitly says the factual claim is
+unverified but may still give a logic-only verdict.
 
-## Авторизация и routing precedence
+Also provide an explicit complex-reasoning route: an admin can run
+/deep <question> or /deep@bot <question>. It creates kind="deep_reply" and calls
+Pro without Tavily or a judge verdict template. This is not a hidden classifier
+or silent cost escalation: ordinary mention/reply remains Flash and Pro is always
+selected explicitly.
 
-- `/judge [N]`, `/спор [N]` и mention текущего бота с нормализованной фразой
-  «рассуди», «рассуди нас» или «кто прав» сначала распознаются как **judge
-  intent независимо от роли**, а затем разрешаются только
-  `is_admin(author_id)` в `TELEGRAM_ALLOWED_CHAT_ID`.
-- Не-admin получает короткий отказ без QStash/LLM/Tavily; распознанный judge
-  intent считается полностью обработанным и не может fall through в обычный
+## Authorization and routing precedence
+
+- /judge [N], /dispute [N], and a mention of the current bot containing a
+  normalised English phrase such as “judge us” or “who is right” are recognised
+  as judge intent before role evaluation. Only is_admin(author_id) in the allowed
+  group may run it.
+- A non-admin receives a short refusal with no QStash, LLM, or Tavily call.
+  Recognised judge intent is fully handled and cannot fall through to ordinary
   explicit Flash reply.
-- Command suffix должен отсутствовать или совпадать с username текущего бота.
-- Webhook precedence определяется после secret/allowed-chat gate, но **до**
-  upsert текущего trigger, чтобы routed job мог зафиксировать pre-trigger
-  snapshot:
-  1. judge command/phrase intent → authorization → judge job либо local refusal;
-  2. `/deep` admin command → Pro `deep_reply` job;
-  3. остальные admin commands;
-  4. обычный explicit mention/reply;
-  5. unmentioned auto rules.
-  Один update создаёт максимум один job.
+- A command suffix must be absent or identify the current bot.
+- After secret/allowed-chat gating but before trigger upsert, routing precedence
+  is:
+  1. judge command or phrase → authorization → judge job or local refusal;
+  2. /deep admin command → Pro deep_reply job;
+  3. other admin commands;
+  4. ordinary explicit mention/reply;
+  5. unmentioned automatic rules.
+  One update creates at most one job.
 
-После route/snapshot common flow идемпотентно upsert-ит current history/user,
-затем enqueue-ит job или формирует local refusal/usage response. Так и command,
-и refusal остаются в общей истории, но не попадают в свой snapshot.
+The common flow then upserts current history/user and either queues the job or
+returns a local refusal/usage message. The command/refusal enters common history
+but never its own pre-trigger snapshot.
 
-`N` по умолчанию берётся из `judge_default_n` (20), integer request клампится в
-`[5,30]`. Judge command/phrase хранится в общей истории, но исключается из judge
-transcript. Если до него меньше 3 содержательных сообщений или меньше 2 human
-authors, бот без LLM сообщает «недостаточно контекста».
+N defaults to judge_default_n, initially 20, and is clamped to [5,30]. The
+judge command/phrase is stored in history but excluded from the judge transcript.
+If there are fewer than three meaningful records or fewer than two human authors,
+reply locally with “not enough context” and do not call an LLM.
 
 ## Durable snapshot
 
-- [ ] Webhook создаёт `kind="judge"` job через state machine Ticket 02.
-- [ ] `request_json` сохраняет **последние N записей до
-  `trigger_message_id`**, chronological, плюс actor/effective tone/admin policy,
-  sorted `member_lists(actor_id, "judge")` и matched `scope="judge"|"all"` rule snapshots.
-  Все они лимитируются теми же caps и сортировкой Ticket 03.
-  Snapshot снимается до upsert команды по common flow Ticket 02, поэтому при
-  `N=30` доступны 30 предшествующих records. Более поздние сообщения и
-  placeholder не могут изменить спор.
-- [ ] Transcript сохраняет `message_id`, author fields, `is_bot`, `ts`, text и
-  reply reference. Пустые/service records отбрасываются до подсчёта N.
-- [ ] QStash body по-прежнему содержит только job ID; private transcript остаётся
-  в Redis с `JOB_RETENTION_SECONDS`.
+- [ ] Create kind="judge" through the Ticket 02 state machine.
+- [ ] request_json contains the latest N records before trigger_message_id in
+  chronological order; actor, effective tone/admin policy; sorted
+  member_lists(actor_id, "judge"); and matched rules scoped judge/all. Apply the
+  same deterministic ordering and caps as Ticket 03.
+- [ ] Take snapshot before upserting the command. With N=30, it can contain all
+  30 preceding records. Later messages and placeholder cannot change the dispute.
+- [ ] Transcript includes message_id, author fields, is_bot, ts, text, and reply
+  reference. Exclude empty/service records before N counting.
+- [ ] QStash still receives job_id only. Private transcript remains in Redis until
+  JOB_RETENTION_SECONDS expires.
 
 ## Pro client
 
-- [ ] Отдельная factory использует `LLM_MODEL_SMART` и production model ID
-  `deepseek-ai/deepseek-v4-pro`:
+- [ ] Use a dedicated factory with LLM_MODEL_SMART and the production Pro ID:
 
-  ```python
-  base = ChatNVIDIA(
-      model="deepseek-ai/deepseek-v4-pro",
-      api_key=settings.NVIDIA_API_KEY,
-      temperature=0.2,
-      max_completion_tokens=2048,
-  )
-  client = base.with_thinking_mode(enabled=False)
-  ```
+~~~python
+base = ChatNVIDIA(
+    model="deepseek-ai/deepseek-v4-pro",
+    api_key=settings.NVIDIA_API_KEY,
+    temperature=0.2,
+    max_completion_tokens=2048,
+)
+client = base.with_thinking_mode(enabled=False)
+~~~
 
-- [ ] Тот же contract test pin `langchain-nvidia-ai-endpoints==1.4.3` проверяет
-  фактический `chat_template_kwargs.thinking=false`, model ID и отсутствие
-  literal root `extra_body`/`reasoning_effort`. Это следует текущему hosted NIM
-  примеру Pro; включение thinking требует отдельного live-verified изменения.
-- [ ] В Telegram уходит только финальный `.content`. `reasoning_content`, thinking
-  tags и внутренние chain-of-thought данные не логируются и не показываются.
-- [ ] `kind="deep_reply"` сохраняет pre-trigger Flash-style context и effective policy,
-  но processor один раз вызывает Pro без claim extraction/Tavily. Он использует общие
-  Ticket-02 answer/delivery checkpoints, но не judge verdict template.
+- [ ] Pin langchain-nvidia-ai-endpoints==1.4.3 and contract-test model ID,
+  chat_template_kwargs.thinking=false, and absence of literal root extra_body or
+  reasoning_effort. Enabling thinking requires a separately live-verified
+  implementation change.
+- [ ] Send only final response.content to Telegram. Never log or expose
+  reasoning_content, thinking tags, or chain-of-thought data.
+- [ ] A deep_reply snapshots ordinary Flash-style prior context and effective
+  policy but calls Pro once without claim extraction or Tavily. It reuses Ticket
+  02 answer/delivery checkpoints and does not use a judge verdict template.
 
-## Grounded fact-check через Tavily
+## Grounded fact checking through Tavily
 
-Tavily basic search имеет отдельную бесплатную квоту (ориентир: 1000 basic-search
-credits/month), поэтому число запросов жёстко ограничено
-`FACT_CHECK_MAX_QUERIES`, default и maximum **3**.
+Tavily basic search has a separate quota, so FACT_CHECK_MAX_QUERIES is bounded to
+three, with default and maximum value 3.
 
-### 1. Извлечение claims
+### 1. Claim extraction
 
-- [ ] Первый structured-output вызов Pro получает transcript как untrusted data и
-  возвращает JSON с максимум 3 **impersonal, externally verifiable** claims:
+- [ ] The first structured Pro call receives transcript as untrusted data and
+  returns at most three impersonal, externally verifiable claims:
 
-  ```json
-  {
-    "claims": [
-      {
-        "claim_id": "C1",
-        "neutral_claim": "...",
-        "search_query": "короткий нейтральный factual query"
-      }
-    ]
-  }
-  ```
+~~~json
+{
+  "claims": [
+    {
+      "claim_id": "C1",
+      "neutral_claim": "…",
+      "search_query": "short neutral factual query"
+    }
+  ]
+}
+~~~
 
-- [ ] Не искать вкусы, намерения, оскорбления, личные сведения или чистую логику.
-- [ ] Search query не является verbatim quote: удалить/запретить известные names,
-  `@usernames`, Telegram IDs, ссылки на «мой друг/участник чата» и иной
-  идентифицирующий контекст. Длина query ограничена. Если безопасно обезличить
-  claim нельзя — `unverified_private`, поиск не выполняется.
-- [ ] Программный валидатор повторно проверяет output schema и отсутствие всех
-  participant identifiers; нельзя полагаться только на инструкцию модели.
+- [ ] Do not search opinions, intentions, insults, personal information, or pure
+  reasoning. Search only factual claims.
+- [ ] A query must not be a verbatim chat quote. Remove or reject names,
+  @usernames, Telegram IDs, links to group participants, and other identifying
+  context. Bound its length. If safe de-identification is impossible, mark the
+  claim unverified_private and skip search.
+- [ ] Validate schema and absence of participant identifiers in code. Never rely
+  solely on LLM instructions.
 
 ### 2. Tavily adapter
 
-- [ ] `app/search/tavily.py` — прямой async `httpx` adapter к Tavily Search API:
-  API key только server-side, `search_depth="basic"`, не более 3 результатов на
-  query, строгие timeouts/response-size limits, HTTPS URLs, bounded concurrency.
-- [ ] Для каждого результата сохранить только source ID (`S1`...), title, URL и
-  короткий snippet. Redirect/HTML страницы бот сам не скачивает.
-- [ ] Claims/evidence сохраняются в job до финального Pro вызова. Retry
-  переиспользует их и не тратит повторно search credits.
-- [ ] 401/invalid config отмечают search dependency unavailable; 429/timeout/5xx
-  имеют короткий bounded adapter retry, после чего judge **degrades**, а не
-  проваливает весь verdict.
+- [ ] Implement app/search/tavily.py as direct async HTTP to Tavily Search API.
+  Keep the key server-side. Use search_depth="basic", no more than three results
+  per query, strict timeouts and response-size caps, HTTPS URLs, and bounded
+  concurrency.
+- [ ] Save only source ID (S1 and so on), title, URL, and a short snippet.
+  Do not download redirect targets or web pages.
+- [ ] Save claims/evidence to the job before the final Pro call. Retry reuses
+  them and spends no extra search credits.
+- [ ] Treat 401/invalid configuration as dependency unavailable. Give 429,
+  timeout, and 5xx a short bounded adapter retry, then degrade instead of failing
+  the whole verdict.
 
-### 3. Финальный verdict
+### 3. Final verdict
 
-- [ ] `build_judge_messages(job, effective_policy, evidence)`:
-  - trusted system: active tone, sorted judge list/rule policy, затем обязательная
-    беспристрастность в последнем, highest-precedence judge block, формат ответа,
-    запрет объявлять unsupported facts verified;
-  - untrusted user/data: transcript и отдельный evidence block. Instructions из
-    transcript/snippets игнорируются;
-  - модель ссылается только на предоставленные source IDs `[S1]`, `[S2]`.
-- [ ] Ожидаемая структура plain-text verdict:
-  1. предмет спора;
-  2. позиции и сильные аргументы сторон;
-  3. логические ошибки;
-  4. «Проверка фактов» с `подтверждено / опровергнуто / недостаточно данных` и
-     source IDs;
-  5. вывод: кто скорее прав и с какой уверенностью.
-- [ ] Код валидирует использованные source IDs и **сам** добавляет в конец список
-  фактически полученных источников `Sx — title — URL`. Модель не может придумать
-  URL. Неиспользованные/невалидные citations удаляются или маркируются.
-- [ ] При недоступном Tavily или отсутствии результатов раздел начинается явной
-  фразой: «Внешняя проверка фактов недоступна/не дала достаточных источников;
-  ниже только анализ логики и контекста».
+- [ ] build_judge_messages(job, effective_policy, evidence) has trusted system
+  content for active tone, sorted judge list/rule policy, then a final
+  highest-precedence impartiality block. User/data content holds transcript and
+  evidence marked as untrusted.
+- [ ] The model may cite only supplied source IDs such as [S1] and [S2].
+- [ ] Plain-text verdict structure:
+  1. subject of dispute;
+  2. positions and strongest arguments;
+  3. reasoning errors;
+  4. fact check: confirmed, refuted, or insufficient evidence with source IDs;
+  5. conclusion: who is more likely right and confidence.
+- [ ] Validate cited source IDs. Code itself appends a source list of actual
+  Sx — title — URL records. The model cannot invent a URL. Remove or label
+  unused/invalid citations.
+- [ ] When Tavily is unavailable or returns no adequate result, begin the fact
+  section with an explicit notice that external verification was unavailable or
+  insufficient and the remainder is logic/context analysis only.
 
-## Worker/delivery integration
+## Worker and delivery integration
 
-- [ ] Processor dispatch `judge` выполняет idempotent stages:
-  `claim_extraction → evidence_saved → verdict_saved → delivery`.
-  Stage/result checkpoint-ятся в job; retry не повторяет успешный Pro/search call.
-- [ ] Placeholder и `typing` используют общий Ticket 02 path. Все части ответа
-  проходят общий splitter `<=4000`, сохраняются как outbound history и только
-  после полной доставки job становится `delivered`.
-- [ ] Vercel worker имеет `maxDuration: 300`; HTTP/LLM/search timeouts оставляют
-  запас и укладываются в общий 240s worker budget/renewable 270s fenced lease, а
-  не равны 300 секундам.
-- [ ] Logic-only fallback считается успешным delivered verdict только если в нём
-  явно раскрыто отсутствие grounded verification.
+- [ ] Dispatch judge through idempotent stages:
+  claim_extraction → evidence_saved → verdict_saved → delivery.
+  Checkpoint every stage/result so retry never repeats a successful Pro/search
+  call.
+- [ ] Use the Ticket 02 placeholder, typing, splitter, outbound-history, and
+  final-delivery path.
+- [ ] Keep HTTP/LLM/search timeouts inside Vercel maxDuration=300 and the common
+  240-second worker budget with renewable 270-second fencing lease.
+- [ ] A logic-only fallback is delivered successfully only when it explicitly
+  discloses that grounded verification was unavailable.
 
-## Безопасность и приватность
+## Privacy and safety
 
-- В Tavily уходят только короткие neutral queries после программной очистки.
-  Никогда не уходят participant names, usernames, IDs, raw messages или полный
-  transcript.
-- В NVIDIA уходит snapshot спора; это отражено в participant privacy notice и
-  purge/retention contract.
-- Search snippets — недоверенные данные и потенциальный prompt injection; они не
-  становятся system instruction.
-- Логи содержат количество claims/results, source domains, latency/status, но не
-  queries, snippets или transcript.
+- Send Tavily only short neutral, programmatically scrubbed queries. Never send
+  participant names, usernames, IDs, raw messages, or full transcript.
+- NVIDIA receives the dispute snapshot; the participant privacy notice must say
+  this.
+- Search snippets are untrusted data and may contain prompt injection. They never
+  become system instructions.
+- Logs contain claim/result count, source domains, latency, and status only; no
+  queries, snippets, or transcript.
 
-## Настройки
+## Configuration
 
-```dotenv
+~~~dotenv
 LLM_MODEL_SMART=deepseek-ai/deepseek-v4-pro
 TAVILY_API_KEY=replace_me
 FACT_CHECK_MAX_QUERIES=3
-```
+~~~
 
-`FACT_CHECK_MAX_QUERIES` валидируется как `1..3`. Без Tavily key локальный запуск
-разрешён в degraded mode, но production health показывает dependency disabled,
-а live acceptance фактической проверки не пройдена.
+Validate FACT_CHECK_MAX_QUERIES in range 1..3. Local work may degrade without a
+Tavily key, but production health marks the dependency disabled and live
+fact-check acceptance is not complete.
 
-## Автоматические проверки
+## Automated checks
 
-- [ ] Admin/non-admin, `/judge`, `/спор`, `/deep`, foreign command suffix, phrase
-  precedence, non-admin phrase не падает в Flash, один job на update.
-- [ ] `N` default/clamp, cutoff до command, поздние сообщения не входят,
-  insufficient-context branch без LLM.
-- [ ] Judge policy: deterministic/capped `applies_to=judge` lists и `scope=judge|all`
-  rules в snapshot; final impartiality block не даёт им смещать verdict.
-- [ ] Pro payload соответствует проверенному non-thinking wire contract;
-  reasoning content, если provider всё же его вернул, не попадает в output.
-- [ ] Claim schema: max 3, private/non-verifiable rejection, identifier scrub,
-  no raw quote in Tavily request.
-- [ ] Tavily adapter request limits; 200/empty/401/429/timeout/malformed response;
-  evidence is checkpointed and retry does not repeat search.
-- [ ] Citation allowlist: output URLs только из реального adapter result; malicious
-  snippet instruction остаётся data.
-- [ ] Degraded verdict явно сообщает, что facts unverified.
-- [ ] Long verdict uses shared splitter/outbound history; Ticket 01–03 tests и CI
-  остаются зелёными.
+- [ ] Admin/non-admin route tests for /judge, /dispute, /deep, foreign suffix,
+  phrase precedence, no Flash fall-through for rejected judge intent, and one
+  job per update.
+- [ ] N default/clamp, snapshot cutoff before command, later-message exclusion,
+  and insufficient-context branch with no LLM.
+- [ ] Deterministic/capped judge lists and judge/all rules in snapshot. Final
+  impartiality policy cannot be weakened by list/rule text.
+- [ ] Pro request shape, no reasoning output exposure, and deep_reply flow.
+- [ ] Claim schema maximum, private/non-verifiable rejection, identifier scrub,
+  and no raw quote in Tavily query.
+- [ ] Tavily request limits; success, empty, 401, 429, timeout, and malformed
+  response. Evidence checkpoint prevents repeated search.
+- [ ] Citation allowlist, malicious snippet treated as data, and explicit
+  degraded-verdict disclosure.
+- [ ] Long verdict splitting/outbound history and all Ticket 01–03 tests/Ruff/CI.
 
-## Критерии приёмки (live E2E)
+## Live E2E acceptance
 
-1. В тестовой группе два участника разыгрывают спор с аргументами и проверяемым
-   публичным утверждением; admin выполняет `/judge 10`.
-2. Ответ использует только 10 сообщений **до** команды, правильно приписывает
-   позиции, называет логические ошибки и даёт понятный confidence.
-3. С настроенным Tavily key раздел фактов содержит хотя бы одну проверку с
-   `[Sx]`, а в конце есть реальный title+URL из Tavily. В server trace не было
-   имён/usernames/raw transcript в search request.
-4. `@bot рассуди нас, кто прав?` от admin запускает тот же Pro path; та же фраза
-   от обычного user получает отказ и не расходует NIM/Tavily.
-5. `/tone sarcastic_robot`, затем `/judge`: манера меняется, но facts/citations и
-   беспристрастность сохраняются.
-6. При искусственной Tavily timeout verdict приходит как logic-only с явным
-   предупреждением. Повтор QStash не повторяет уже сохранённые searches/verdict
-   и не создаёт дубликат Telegram ответа.
-7. Observability/contract подтверждают модель `deepseek-ai/deepseek-v4-pro` и
-   `chat_template_kwargs.thinking=false`; служебное reasoning в чат не попадает;
-   функция укладывается в 300 секунд.
+1. In a test group, two participants have a dispute containing a public,
+   checkable claim. An admin runs /judge 10.
+2. The answer uses exactly the 10 messages before the command, attributes
+   positions correctly, identifies reasoning errors, and gives clear confidence.
+3. With Tavily configured, the fact section contains at least one [Sx] reference
+   and an appended real Tavily title+URL. Server trace has no
+   names/usernames/raw transcript in search request.
+4. An admin writes @bot judge us, who is right? and follows the Pro path. The
+   same phrase from a normal user is refused with no NIM/Tavily spend.
+5. After /tone sarcastic_robot, /judge changes manner but preserves facts,
+   citations, and impartiality.
+6. An induced Tavily timeout gives a logic-only verdict with explicit warning.
+   QStash retry does not repeat saved searches/verdict or duplicate Telegram
+   output.
+7. Observability/contract tests confirm DeepSeek V4 Pro and
+   chat_template_kwargs.thinking=false; no reasoning reaches chat; execution fits
+   within 300 seconds.
 
-## Риски
+## Risks
 
-- Search quota ограничена: max 3, basic depth, сохранение evidence и отсутствие
-  повторного поиска на retry обязательны.
-- Источник может быть слабым или противоречивым; verdict отражает качество и
-  uncertainty, а не объявляет первый snippet истиной.
-- Pro + два model calls + search медленнее flash; staged checkpoints и 300-second
-  worker limit обязательны.
+- Search quota is limited: basic depth, maximum three queries, saved evidence,
+  and no repeat search on retry are mandatory.
+- Sources may be weak or contradictory. Verdict must represent uncertainty rather
+  than treating the first snippet as truth.
+- Pro plus two model calls and search can be slow. Staged checkpoints and the
+  300-second function limit are essential.
