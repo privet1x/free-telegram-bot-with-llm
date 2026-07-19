@@ -4,9 +4,10 @@
 **Unblocks:** —
 **Shared contract:** 00-ARCHITECTURE.md sections 3, 4, and 8
 
-**Status:** Completion candidate under the required independent review gates.
-Local automated checks pass; live stable-deployment Telegram OIDC, Vercel,
-Upstash, and group acceptance remains pending explicit authorization.
+**Status:** Implemented and shipped; live acceptance pending. Commit `b26ced7`
+is on `origin/master` after the required independent review gates and 410
+passing local tests. Stable-deployment Telegram OIDC, Vercel, Upstash, and group
+acceptance remains pending explicit authorization.
 
 ## Goal
 

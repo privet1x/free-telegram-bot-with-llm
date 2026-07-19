@@ -8,8 +8,8 @@ webhook model.
 The implementation plan and the shared architecture contract are in
 [`tickets/`](tickets/README.md).
 
-Current status: **Tickets 01–04 are implemented; the Ticket 05 completion
-candidate is passing local checks and remains under its required review gates.**
+Current status: **Tickets 01–05 are implemented and pass their required local
+automated and independent review gates.** Ticket 05 shipped in commit `b26ced7`.
 The bot includes durable mention/reply jobs, deterministic policies,
 automatic routing, tone control, grounded judge workflows, Telegram OIDC admin
 authentication, CRUD controls, and privacy deletion. Live

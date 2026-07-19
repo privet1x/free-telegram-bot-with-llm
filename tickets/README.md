@@ -53,7 +53,7 @@ A ticket is complete only when:
 5. README, environment template, deployment instructions, and the privacy notice
    are updated with the feature.
 
-Tickets 01–04 have completed the local implementation and automated-check
-portion. Ticket 05 is under its required review gates. All live
+Tickets 01–05 have completed implementation, automated checks, and required
+local review gates. Ticket 05 shipped in commit `b26ced7`. All live
 Vercel/Telegram/Upstash/QStash/NVIDIA/Tavily/OIDC acceptance checks remain
 pending authorized deployment and provider interaction.
