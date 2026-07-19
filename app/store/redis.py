@@ -76,6 +76,7 @@ class KV(Protocol):
         ex: Optional[int] = None,
         prune_field: Optional[str] = None,
         min_value: Optional[int] = None,
+        block_key: Optional[str] = None,
     ) -> int: ...
     def list_prune_json(self, key: str, field: str, min_value: int) -> int: ...
     def observe_user_json(
@@ -84,8 +85,46 @@ class KV(Protocol):
     def sadd(self, key: str, *members: str) -> int: ...
     def sismember(self, key: str, member: str) -> bool: ...
     def smembers(self, key: str) -> set[str]: ...
+    def set_add_expiring(self, key: str, members: set[str], ex: int) -> set[str]: ...
     def srem(self, key: str, *members: str) -> int: ...
     def delete_if_value(self, key: str, expected: str) -> bool: ...
+    def increment(self, key: str) -> int: ...
+    def admin_role_change(self, user_id: int, *, add: bool) -> bool: ...
+    def rate_limit(self, key: str, limit: int, window_seconds: int) -> bool: ...
+    def indexed_json_put(
+        self,
+        index_key: str,
+        item_key: str,
+        member: str,
+        value: str,
+        *,
+        create_only: bool,
+    ) -> str: ...
+    def indexed_delete(self, index_key: str, item_key: str, member: str) -> bool: ...
+    def rename_indexed_set(
+        self,
+        index_key: str,
+        old_item_key: str,
+        new_item_key: str,
+        old_members_key: str,
+        new_members_key: str,
+        old_member: str,
+        new_member: str,
+        value: str,
+    ) -> str: ...
+    def list_member_add(self, meta_key: str, members_key: str, member: str) -> str: ...
+    def list_delete(
+        self, index_key: str, meta_key: str, members_key: str, member: str
+    ) -> bool: ...
+    def delete_user_alias(self, user_id: int) -> bool: ...
+    def delete_user_data(self, user_id: int) -> tuple[bool, int]: ...
+    def list_privacy_filter(
+        self,
+        key: str,
+        user_id: int,
+        outbound_message_ids: set[int],
+    ) -> int: ...
+    def list_remove_message_ids(self, key: str, message_ids: set[int]) -> int: ...
     def delete(self, *keys: str) -> int: ...
     def backend(self) -> str: ...
 
@@ -208,6 +247,7 @@ class MemoryKV:
         ex: Optional[int] = None,
         prune_field: Optional[str] = None,
         min_value: Optional[int] = None,
+        block_key: Optional[str] = None,
     ) -> int:
         """Atomically keep the newest version and newest chronological items."""
         if limit <= 0:
@@ -216,6 +256,10 @@ class MemoryKV:
             raise ValueError("ex must be positive")
         with self._lock:
             self._purge_if_expired(key)
+            if block_key is not None:
+                self._purge_if_expired(block_key)
+                if block_key in self._values:
+                    return len(self._lists.get(key, []))
             items = self._lists.setdefault(key, [])
             try:
                 incoming = json.loads(value)
@@ -419,6 +463,16 @@ class MemoryKV:
             self._purge_if_expired(key)
             return set(self._sets.get(key, set()))
 
+    def set_add_expiring(self, key: str, members: set[str], ex: int) -> set[str]:
+        if ex <= 0:
+            raise ValueError("ex must be positive")
+        with self._lock:
+            self._purge_if_expired(key)
+            values = self._sets.setdefault(key, set())
+            values.update(str(member) for member in members)
+            self._expiry[key] = time.time() + ex
+            return set(values)
+
     def srem(self, key: str, *members: str) -> int:
         with self._lock:
             self._purge_if_expired(key)
@@ -437,6 +491,251 @@ class MemoryKV:
             self._values.pop(key, None)
             self._expiry.pop(key, None)
             return True
+
+    def increment(self, key: str) -> int:
+        with self._lock:
+            self._purge_if_expired(key)
+            try:
+                value = int(self._values.get(key, "0")) + 1
+            except ValueError:
+                value = 1
+            self._set_unlocked(key, str(value), None)
+            return value
+
+    def admin_role_change(self, user_id: int, *, add: bool) -> bool:
+        member = str(user_id)
+        version_key = f"adminver:{user_id}"
+        with self._lock:
+            members = self._sets.setdefault("admins", set())
+            changed = member not in members if add else member in members
+            if not changed:
+                return False
+            if add:
+                members.add(member)
+            else:
+                members.remove(member)
+                if not members:
+                    self._sets.pop("admins", None)
+            try:
+                version = int(self._values.get(version_key, "0")) + 1
+            except ValueError:
+                version = 1
+            self._set_unlocked(version_key, str(version), None)
+            return True
+
+    def rate_limit(self, key: str, limit: int, window_seconds: int) -> bool:
+        if limit <= 0 or window_seconds <= 0:
+            raise ValueError("rate limit values must be positive")
+        with self._lock:
+            self._purge_if_expired(key)
+            try:
+                count = int(self._values.get(key, "0")) + 1
+            except ValueError:
+                count = 1
+            remaining = self._expiry.get(key)
+            ttl = (
+                max(int(remaining - time.time()), 1)
+                if remaining is not None
+                else window_seconds
+            )
+            self._set_unlocked(key, str(count), ttl)
+            return count <= limit
+
+    def indexed_json_put(
+        self,
+        index_key: str,
+        item_key: str,
+        member: str,
+        value: str,
+        *,
+        create_only: bool,
+    ) -> str:
+        with self._lock:
+            self._purge_if_expired(item_key)
+            exists = item_key in self._values
+            if create_only and exists:
+                return "exists"
+            self._set_unlocked(item_key, value, None)
+            self._sets.setdefault(index_key, set()).add(member)
+            return "created" if not exists else "updated"
+
+    def indexed_delete(self, index_key: str, item_key: str, member: str) -> bool:
+        with self._lock:
+            existed = item_key in self._values
+            self._values.pop(item_key, None)
+            self._expiry.pop(item_key, None)
+            values = self._sets.get(index_key)
+            if values is not None:
+                values.discard(member)
+                if not values:
+                    self._sets.pop(index_key, None)
+            return existed
+
+    def rename_indexed_set(
+        self,
+        index_key: str,
+        old_item_key: str,
+        new_item_key: str,
+        old_members_key: str,
+        new_members_key: str,
+        old_member: str,
+        new_member: str,
+        value: str,
+    ) -> str:
+        with self._lock:
+            if old_item_key not in self._values:
+                return "missing"
+            if old_item_key != new_item_key and new_item_key in self._values:
+                return "exists"
+            members = set(self._sets.get(old_members_key, set()))
+            self._set_unlocked(new_item_key, value, None)
+            self._sets.setdefault(index_key, set()).discard(old_member)
+            self._sets[index_key].add(new_member)
+            if new_members_key != old_members_key:
+                if members:
+                    self._sets[new_members_key] = members
+                self._sets.pop(old_members_key, None)
+            if old_item_key != new_item_key:
+                self._values.pop(old_item_key, None)
+                self._expiry.pop(old_item_key, None)
+            return "renamed"
+
+    def list_member_add(self, meta_key: str, members_key: str, member: str) -> str:
+        with self._lock:
+            if meta_key not in self._values:
+                return "missing"
+            values = self._sets.setdefault(members_key, set())
+            if member in values:
+                return "existing"
+            values.add(member)
+            return "added"
+
+    def list_delete(
+        self, index_key: str, meta_key: str, members_key: str, member: str
+    ) -> bool:
+        with self._lock:
+            existed = meta_key in self._values
+            self._values.pop(meta_key, None)
+            self._expiry.pop(meta_key, None)
+            self._sets.pop(members_key, None)
+            index = self._sets.get(index_key)
+            if index is not None:
+                index.discard(member)
+                if not index:
+                    self._sets.pop(index_key, None)
+            return existed
+
+    def delete_user_alias(self, user_id: int) -> bool:
+        profile_key = f"user:{user_id}"
+        with self._lock:
+            raw = self._values.get(profile_key)
+            try:
+                profile = json.loads(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                profile = None
+            username = profile.get("username") if isinstance(profile, dict) else None
+            normalized_username = (
+                username.strip().lstrip("@").casefold()
+                if isinstance(username, str) and username.strip().lstrip("@")
+                else None
+            )
+            existed = profile_key in self._values
+            self._values.pop(profile_key, None)
+            self._expiry.pop(profile_key, None)
+            if normalized_username:
+                alias_key = f"username:{normalized_username}"
+                if self._values.get(alias_key) == str(user_id):
+                    self._values.pop(alias_key, None)
+                    self._expiry.pop(alias_key, None)
+            return existed
+
+    def delete_user_data(self, user_id: int) -> tuple[bool, int]:
+        profile_key = f"user:{user_id}"
+        with self._lock:
+            raw = self._values.get(profile_key)
+            try:
+                profile = json.loads(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                profile = None
+            username = profile.get("username") if isinstance(profile, dict) else None
+            normalized_username = (
+                username.strip().lstrip("@").casefold()
+                if isinstance(username, str) and username.strip().lstrip("@")
+                else None
+            )
+            existed = profile_key in self._values
+            self._values.pop(profile_key, None)
+            self._expiry.pop(profile_key, None)
+            if normalized_username:
+                alias_key = f"username:{normalized_username}"
+                if self._values.get(alias_key) == str(user_id):
+                    self._values.pop(alias_key, None)
+                    self._expiry.pop(alias_key, None)
+            removed = 0
+            for slug in self._sets.get("lists:index", set()):
+                members_key = f"list:{slug}:members"
+                members = self._sets.get(members_key)
+                if members is not None and str(user_id) in members:
+                    members.remove(str(user_id))
+                    removed += 1
+                    if not members:
+                        self._sets.pop(members_key, None)
+            return existed, removed
+
+    def list_privacy_filter(
+        self,
+        key: str,
+        user_id: int,
+        outbound_message_ids: set[int],
+    ) -> int:
+        with self._lock:
+            self._purge_if_expired(key)
+            kept: list[str] = []
+            for raw in self._lists.get(key, []):
+                try:
+                    record = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if record.get("user_id") == user_id:
+                    continue
+                if record.get("is_bot") is True and record.get("message_id") in outbound_message_ids:
+                    continue
+                reply = record.get("reply_to")
+                if isinstance(reply, dict) and reply.get("user_id") == user_id:
+                    reply = dict(reply)
+                    reply["user_id"] = None
+                    reply["text"] = None
+                    record["reply_to"] = reply
+                kept.append(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+            if kept:
+                self._lists[key] = kept
+            else:
+                self._lists.pop(key, None)
+                self._expiry.pop(key, None)
+            return len(kept)
+
+    def list_remove_message_ids(self, key: str, message_ids: set[int]) -> int:
+        with self._lock:
+            self._purge_if_expired(key)
+            kept: list[str] = []
+            for raw in self._lists.get(key, []):
+                try:
+                    record = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    isinstance(record, dict)
+                    and record.get("message_id") not in message_ids
+                ):
+                    kept.append(raw)
+            if kept:
+                self._lists[key] = kept
+            else:
+                self._lists.pop(key, None)
+                self._expiry.pop(key, None)
+            return len(kept)
 
     def delete(self, *keys: str) -> int:
         with self._lock:
@@ -515,12 +814,17 @@ class UpstashKV:
         ex: Optional[int] = None,
         prune_field: Optional[str] = None,
         min_value: Optional[int] = None,
+        block_key: Optional[str] = None,
     ) -> int:
         if limit <= 0:
             raise ValueError("limit must be positive")
         if ex is not None and ex <= 0:
             raise ValueError("ex must be positive")
         script = """
+        if ARGV[8] == '1' and redis.call('EXISTS', KEYS[2]) == 1 then
+            return redis.call('LLEN', KEYS[1])
+        end
+
         local function integer_field(decoded, field)
             local value = decoded[field]
             if type(value) == 'number' and value % 1 == 0 then
@@ -633,7 +937,7 @@ class UpstashKV:
             self._call(
                 "eval",
                 script,
-                keys=[key],
+                keys=[key, *([block_key] if block_key is not None else [])],
                 args=[
                     identity_field,
                     identity_value,
@@ -642,6 +946,7 @@ class UpstashKV:
                     str(ex or 0),
                     prune_field or "",
                     str(min_value) if min_value is not None else "",
+                    "1" if block_key is not None else "0",
                 ],
             )
         )
@@ -791,12 +1096,315 @@ class UpstashKV:
     def smembers(self, key: str) -> set[str]:
         return {str(item) for item in (self._call("smembers", key) or [])}
 
+    def set_add_expiring(self, key: str, members: set[str], ex: int) -> set[str]:
+        if ex <= 0:
+            raise ValueError("ex must be positive")
+        script = """
+        for index = 2, #ARGV do redis.call('SADD', KEYS[1], ARGV[index]) end
+        redis.call('EXPIRE', KEYS[1], ARGV[1])
+        return redis.call('SMEMBERS', KEYS[1])
+        """
+        result = self._call(
+            "eval",
+            script,
+            keys=[key],
+            args=[str(ex), *sorted(members)],
+        )
+        return {str(item) for item in (result or [])}
+
     def srem(self, key: str, *members: str) -> int:
         return int(self._call("srem", key, *members))
 
     def delete_if_value(self, key: str, expected: str) -> bool:
         script = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end"
         return bool(self._call("eval", script, keys=[key], args=[expected]))
+
+    def increment(self, key: str) -> int:
+        return int(self._call("incr", key))
+
+    def admin_role_change(self, user_id: int, *, add: bool) -> bool:
+        script = """
+        local member = ARGV[1]
+        local changed
+        if ARGV[2] == '1' then
+            changed = redis.call('SADD', KEYS[1], member)
+        else
+            changed = redis.call('SREM', KEYS[1], member)
+        end
+        if changed == 1 then redis.call('INCR', KEYS[2]) end
+        return changed
+        """
+        return bool(
+            self._call(
+                "eval",
+                script,
+                keys=["admins", f"adminver:{user_id}"],
+                args=[str(user_id), "1" if add else "0"],
+            )
+        )
+
+    def rate_limit(self, key: str, limit: int, window_seconds: int) -> bool:
+        if limit <= 0 or window_seconds <= 0:
+            raise ValueError("rate limit values must be positive")
+        script = """
+        local count = redis.call('INCR', KEYS[1])
+        if count == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
+        return count <= tonumber(ARGV[1]) and 1 or 0
+        """
+        return bool(
+            self._call(
+                "eval",
+                script,
+                keys=[key],
+                args=[str(limit), str(window_seconds)],
+            )
+        )
+
+    def indexed_json_put(
+        self,
+        index_key: str,
+        item_key: str,
+        member: str,
+        value: str,
+        *,
+        create_only: bool,
+    ) -> str:
+        script = """
+        local exists = redis.call('EXISTS', KEYS[2]) == 1
+        if ARGV[3] == '1' and exists then return 'exists' end
+        redis.call('SET', KEYS[2], ARGV[2])
+        redis.call('SADD', KEYS[1], ARGV[1])
+        return exists and 'updated' or 'created'
+        """
+        return str(
+            self._call(
+                "eval",
+                script,
+                keys=[index_key, item_key],
+                args=[member, value, "1" if create_only else "0"],
+            )
+        )
+
+    def indexed_delete(self, index_key: str, item_key: str, member: str) -> bool:
+        script = "local removed = redis.call('DEL', KEYS[2]); redis.call('SREM', KEYS[1], ARGV[1]); return removed"
+        return bool(
+            self._call(
+                "eval", script, keys=[index_key, item_key], args=[member]
+            )
+        )
+
+    def rename_indexed_set(
+        self,
+        index_key: str,
+        old_item_key: str,
+        new_item_key: str,
+        old_members_key: str,
+        new_members_key: str,
+        old_member: str,
+        new_member: str,
+        value: str,
+    ) -> str:
+        script = """
+        if redis.call('EXISTS', KEYS[2]) == 0 then return 'missing' end
+        if KEYS[2] ~= KEYS[3] and redis.call('EXISTS', KEYS[3]) == 1 then
+            return 'exists'
+        end
+        redis.call('SET', KEYS[3], ARGV[3])
+        if KEYS[4] ~= KEYS[5] then
+            local members = redis.call('SMEMBERS', KEYS[4])
+            if #members > 0 then redis.call('SADD', KEYS[5], unpack(members)) end
+            redis.call('DEL', KEYS[4])
+        end
+        redis.call('SREM', KEYS[1], ARGV[1])
+        redis.call('SADD', KEYS[1], ARGV[2])
+        if KEYS[2] ~= KEYS[3] then redis.call('DEL', KEYS[2]) end
+        return 'renamed'
+        """
+        return str(
+            self._call(
+                "eval",
+                script,
+                keys=[
+                    index_key,
+                    old_item_key,
+                    new_item_key,
+                    old_members_key,
+                    new_members_key,
+                ],
+                args=[old_member, new_member, value],
+            )
+        )
+
+    def list_member_add(self, meta_key: str, members_key: str, member: str) -> str:
+        script = """
+        if redis.call('EXISTS', KEYS[1]) == 0 then return 'missing' end
+        local changed = redis.call('SADD', KEYS[2], ARGV[1])
+        return changed == 1 and 'added' or 'existing'
+        """
+        return str(
+            self._call(
+                "eval",
+                script,
+                keys=[meta_key, members_key],
+                args=[member],
+            )
+        )
+
+    def list_delete(
+        self, index_key: str, meta_key: str, members_key: str, member: str
+    ) -> bool:
+        script = """
+        local removed = redis.call('DEL', KEYS[2])
+        redis.call('DEL', KEYS[3])
+        redis.call('SREM', KEYS[1], ARGV[1])
+        return removed
+        """
+        return bool(
+            self._call(
+                "eval",
+                script,
+                keys=[index_key, meta_key, members_key],
+                args=[member],
+            )
+        )
+
+    def delete_user_alias(self, user_id: int) -> bool:
+        script = """
+        local raw = redis.call('GET', KEYS[1])
+        if not raw then return 0 end
+        local ok, profile = pcall(cjson.decode, raw)
+        if ok and type(profile) == 'table' and type(profile['username']) == 'string' then
+            local username = profile['username']
+            username = string.gsub(username, '^%s+', '')
+            username = string.gsub(username, '%s+$', '')
+            username = string.gsub(username, '^@+', '')
+            username = string.lower(username)
+            if username ~= '' then
+                local alias_key = 'username:' .. username
+                if redis.call('GET', alias_key) == ARGV[1] then
+                    redis.call('DEL', alias_key)
+                end
+            end
+        end
+        return redis.call('DEL', KEYS[1])
+        """
+        profile_key = f"user:{user_id}"
+        return bool(
+            self._call(
+                "eval",
+                script,
+                keys=[profile_key],
+                args=[str(user_id)],
+            )
+        )
+
+    def delete_user_data(self, user_id: int) -> tuple[bool, int]:
+        script = """
+        local raw = redis.call('GET', KEYS[1])
+        local existed = raw and 1 or 0
+        if raw then
+            local ok, profile = pcall(cjson.decode, raw)
+            if ok and type(profile) == 'table' and type(profile['username']) == 'string' then
+                local username = profile['username']
+                username = string.gsub(username, '^%s+', '')
+                username = string.gsub(username, '%s+$', '')
+                username = string.gsub(username, '^@+', '')
+                username = string.lower(username)
+                if username ~= '' then
+                    local alias_key = 'username:' .. username
+                    if redis.call('GET', alias_key) == ARGV[1] then
+                        redis.call('DEL', alias_key)
+                    end
+                end
+            end
+        end
+        redis.call('DEL', KEYS[1])
+        local removed = 0
+        for _, slug in ipairs(redis.call('SMEMBERS', KEYS[2])) do
+            removed = removed + redis.call('SREM', 'list:' .. slug .. ':members', ARGV[1])
+        end
+        return {existed, removed}
+        """
+        result = self._call(
+            "eval",
+            script,
+            keys=[f"user:{user_id}", "lists:index"],
+            args=[str(user_id)],
+        )
+        if not isinstance(result, (list, tuple)) or len(result) != 2:
+            raise RuntimeError("invalid Redis user deletion response")
+        return bool(int(result[0])), int(result[1])
+
+    def list_privacy_filter(
+        self,
+        key: str,
+        user_id: int,
+        outbound_message_ids: set[int],
+    ) -> int:
+        script = """
+        local ttl = redis.call('PTTL', KEYS[1])
+        if ttl <= 0 then redis.call('DEL', KEYS[1]); return 0 end
+        local outbound = cjson.decode(ARGV[2])
+        local current = redis.call('LRANGE', KEYS[1], 0, -1)
+        local kept = {}
+        for _, raw in ipairs(current) do
+            local ok, record = pcall(cjson.decode, raw)
+            if ok and type(record) == 'table' and record['user_id'] ~= tonumber(ARGV[1]) then
+                local message_id = tostring(record['message_id'] or '')
+                local remove_bot = record['is_bot'] == true and outbound[message_id] == true
+                if not remove_bot then
+                    local reply = record['reply_to']
+                    if type(reply) == 'table' and reply['user_id'] == tonumber(ARGV[1]) then
+                        reply['user_id'] = cjson.null
+                        reply['text'] = cjson.null
+                    end
+                    table.insert(kept, cjson.encode(record))
+                end
+            end
+        end
+        redis.call('DEL', KEYS[1])
+        for _, raw in ipairs(kept) do redis.call('RPUSH', KEYS[1], raw) end
+        if #kept > 0 then redis.call('PEXPIRE', KEYS[1], ttl) end
+        return #kept
+        """
+        outbound = {str(message_id): True for message_id in outbound_message_ids}
+        return int(
+            self._call(
+                "eval",
+                script,
+                keys=[key],
+                args=[str(user_id), json.dumps(outbound, separators=(",", ":"))],
+            )
+        )
+
+    def list_remove_message_ids(self, key: str, message_ids: set[int]) -> int:
+        script = """
+        local ttl = redis.call('PTTL', KEYS[1])
+        if ttl <= 0 then redis.call('DEL', KEYS[1]); return 0 end
+        local removed = cjson.decode(ARGV[1])
+        local current = redis.call('LRANGE', KEYS[1], 0, -1)
+        local kept = {}
+        for _, raw in ipairs(current) do
+            local ok, record = pcall(cjson.decode, raw)
+            local message_id = ok and type(record) == 'table' and tostring(record['message_id'] or '') or ''
+            if ok and type(record) == 'table' and removed[message_id] ~= true then
+                table.insert(kept, raw)
+            end
+        end
+        redis.call('DEL', KEYS[1])
+        for _, raw in ipairs(kept) do redis.call('RPUSH', KEYS[1], raw) end
+        if #kept > 0 then redis.call('PEXPIRE', KEYS[1], ttl) end
+        return #kept
+        """
+        removed = {str(message_id): True for message_id in message_ids}
+        return int(
+            self._call(
+                "eval",
+                script,
+                keys=[key],
+                args=[json.dumps(removed, separators=(",", ":"))],
+            )
+        )
 
     def delete(self, *keys: str) -> int:
         if not keys:

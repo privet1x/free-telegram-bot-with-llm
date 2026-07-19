@@ -188,6 +188,34 @@ def _create_job(
     return job
 
 
+def _create_judge_job(
+    job_id: int,
+    *,
+    repository: JobRepository | None = None,
+):
+    repo = repository or get_job_repository()
+    request = _request(job_id)
+    request["kind"] = "judge"
+    request["reply_context"] = {
+        "message_id": job_id + 999,
+        "user_id": 6,
+        "username": "bob_private",
+        "name": "Bob Private",
+        "text": "The disputed private statement",
+    }
+    repo.create_reply_job(
+        request,
+        {
+            "base_system_prompt": "Trusted test policy",
+            "actor": {"user_id": 5, "is_admin": False},
+            "list_policies": [],
+            "rule_policies": [],
+        },
+        [5, 6],
+    )
+    return repo.record_publication(job_id, f"qstash-{job_id}")
+
+
 def _telegram_result(
     message_id: int,
     text: str,
@@ -708,6 +736,99 @@ def test_retryable_provider_failure_is_sanitized_and_requeued(
     assert job.error_class == "provider_rate_limited"
     assert len(telegram.send_calls) == 1
     assert telegram.edit_calls == []
+
+
+def test_judge_claim_retry_clears_intent_and_resumes_without_ambiguity(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = get_job_repository()
+    _create_judge_job(306_1, repository=repository)
+    telegram = FakeTelegram()
+    _install_telegram(monkeypatch, telegram)
+    responses: list[str | BaseException] = [
+        LLMRetryableError("provider_rate_limited"),
+        json.dumps(
+            {
+                "claims": [
+                    {
+                        "claim_id": "C1",
+                        "neutral_claim": "A public fact",
+                        "search_query": "public fact verification",
+                    }
+                ]
+            }
+        ),
+        "Logic-only verdict.",
+    ]
+
+    async def generate(_messages: list[object]) -> str:
+        value = responses.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    monkeypatch.setattr(processor, "generate_pro", generate)
+    first = _post_process(client, 306_1)
+    assert first.status_code == 503
+    failed = repository.get(306_1)
+    assert failed is not None and failed.state == "failed_retryable"
+    assert failed.intent("judge_claims") is None
+
+    retry = _post_process(client, 306_1)
+    assert retry.status_code == 200
+    delivered = repository.get(306_1)
+    assert delivered is not None and delivered.state == "delivered"
+    assert len(telegram.send_calls) == 1
+    assert len(telegram.edit_calls) == 1
+
+
+def test_judge_verdict_retry_reuses_claims_and_search_checkpoints(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = get_job_repository()
+    _create_judge_job(306_2, repository=repository)
+    telegram = FakeTelegram()
+    _install_telegram(monkeypatch, telegram)
+    calls: list[list[object]] = []
+    responses: list[str | BaseException] = [
+        json.dumps(
+            {
+                "claims": [
+                    {
+                        "claim_id": "C1",
+                        "neutral_claim": "A public fact",
+                        "search_query": "public fact verification",
+                    }
+                ]
+            }
+        ),
+        LLMRetryableError("provider_rate_limited"),
+        "Recovered verdict.",
+    ]
+
+    async def generate(messages: list[object]) -> str:
+        calls.append(messages)
+        value = responses.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    monkeypatch.setattr(processor, "generate_pro", generate)
+    first = _post_process(client, 306_2)
+    assert first.status_code == 503
+    failed = repository.get(306_2)
+    assert failed is not None
+    assert failed.checkpoint("judge_claims") is not None
+    assert failed.checkpoint("judge_search:0") is not None
+    assert failed.intent("judge_verdict") is None
+
+    retry = _post_process(client, 306_2)
+    assert retry.status_code == 200
+    delivered = repository.get(306_2)
+    assert delivered is not None and delivered.state == "delivered"
+    assert len(calls) == 3
+    assert len(telegram.send_calls) == 1
+    assert len(telegram.edit_calls) == 1
 
 
 def test_permanent_provider_failure_is_terminal_and_edits_known_placeholder(

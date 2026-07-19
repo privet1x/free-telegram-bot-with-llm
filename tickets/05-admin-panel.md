@@ -4,9 +4,9 @@
 **Unblocks:** —
 **Shared contract:** 00-ARCHITECTURE.md sections 3, 4, and 8
 
-**Status:** Partial local implementation only. Authentication foundations and
-read APIs exist; full CRUD/privacy purge, group-membership checks, and complete
-admin UI remain to be implemented before this ticket can pass its review gate.
+**Status:** Completion candidate under the required independent review gates.
+Local automated checks pass; live stable-deployment Telegram OIDC, Vercel,
+Upstash, and group acceptance remains pending explicit authorization.
 
 ## Goal
 
@@ -76,43 +76,43 @@ or provider keys to frontend JavaScript.
 
 ### Configuration and dependencies
 
-- [ ] Add TELEGRAM_OIDC_CLIENT_ID and TELEGRAM_OIDC_CLIENT_SECRET to settings and
+- [x] Add TELEGRAM_OIDC_CLIENT_ID and TELEGRAM_OIDC_CLIENT_SECRET to settings and
   .env.example. Pin PyJWT[crypto]. Keep the secret server-side.
-- [ ] Production validation requires exact HTTPS PUBLIC_BASE_URL, OIDC values, a
+- [x] Production validation requires exact HTTPS PUBLIC_BASE_URL, OIDC values, a
   positive SUPER_ADMIN_ID, and a random SESSION_SECRET of at least 32 bytes.
   Without an environment super-admin, production does not start: there is no
   password/bootstrap endpoint. Health reports dependency names only.
 
 ### Public and authentication endpoints
 
-- [ ] GET /api/public/config returns only:
+- [x] GET /api/public/config returns only:
 
 ~~~json
 {"telegram_bot_username":"bot_name","oidc_client_id":"123..."}
 ~~~
 
-- [ ] GET /api/auth/telegram/start and callback implement the above with scope
+- [x] GET /api/auth/telegram/start and callback implement the above with scope
   only openid profile. Do not request phone or write permissions.
-- [ ] POST /api/auth/logout requires same-origin and CSRF validation and deletes
+- [x] POST /api/auth/logout requires same-origin and CSRF validation and deletes
   the session.
-- [ ] GET /api/admin/me returns safe profile, role, and CSRF token.
+- [x] GET /api/admin/me returns safe profile, role, and CSRF token.
 
 ### Observed users and username resolution
 
-- [ ] GET /api/admin/users?q= does a bounded exact lookup in the Ticket 01
+- [x] GET /api/admin/users?q= does a bounded exact lookup in the Ticket 01
   observed directory by numeric ID or normalized current username. Do not promise
   display-name search without an index.
-- [ ] Numeric Telegram ID input is allowed even before a profile is observed.
-- [ ] Resolve @username only through username:<casefold_without_at>. The Bot API
+- [x] Numeric Telegram ID input is allowed even before a profile is observed.
+- [x] Resolve @username only through username:<casefold_without_at>. The Bot API
   cannot resolve arbitrary usernames. Unknown username returns 422 explaining
   that the person must first message in the allowed group or be entered by
   numeric ID.
-- [ ] Rename uses current index only. A stale alias neither resolves nor grants a
+- [x] Rename uses current index only. A stale alias neither resolves nor grants a
   role to another person.
-- [ ] DELETE /api/admin/users/{id}, super-admin only, collision-safely removes
+- [x] DELETE /api/admin/users/{id}, super-admin only, collision-safely removes
   profile, current username key, list memberships, and assigned admin role while
   incrementing adminver. SUPER_ADMIN_ID cannot be deleted.
-- [ ] With purge_messages=true, atomically remove authored history, clear
+- [x] With purge_messages=true, atomically remove authored history, clear
   reply_to.user_id/text in other records, and cancel/delete indexed jobs whose
   snapshots contain the user. Use delivery checkpoints to remove indexed outbound
   bot history records that could quote the deleted person. If job provenance has
@@ -123,32 +123,32 @@ or provider keys to frontend JavaScript.
 
 All endpoints require current admin unless stated otherwise.
 
-- [ ] GET/POST/DELETE /api/admin/admins. Only super-admin can mutate. Add through
+- [x] GET/POST/DELETE /api/admin/admins. Only super-admin can mutate. Add through
   observed current @username or numeric Telegram ID.
-- [ ] Numeric-ID admin assignment does not require an observed profile. Backend
+- [x] Numeric-ID admin assignment does not require an observed profile. Backend
   calls getChatMember for the configured allowed group, requires current
   member/admin/creator state, and may seed profile from verified result.user.
   Unknown username remains 422; numeric non-member/left/kicked is refused.
   Removing an admin increments adminver.
-- [ ] GET/POST/PUT/DELETE /api/admin/lists plus membership add/remove. Enforce
+- [x] GET/POST/PUT/DELETE /api/admin/lists plus membership add/remove. Enforce
   title, enabled, priority, applies_to, injected_prompt, length limits, and
   reserved ignore protection. UI/API can create/rename a custom list and edit
   every policy field.
-- [ ] GET/POST/PUT/DELETE /api/admin/rules with Ticket 03 canonical priority,
+- [x] GET/POST/PUT/DELETE /api/admin/rules with Ticket 03 canonical priority,
   scope, match.type/value, instruction, and stop_processing. IDs are immutable.
   Update/delete must not leave orphan indexes.
-- [ ] GET /api/admin/tone returns global, chat_override, and effective config.
+- [x] GET /api/admin/tone returns global, chat_override, and effective config.
   PUT accepts explicit scope="global" or "chat", tone_mode, canonical preset,
   custom_system_prompt, and judge_default_n in [5,30]. DELETE
   /api/admin/tone/override atomically clears chat override. API accepts only
   neutral, serious, scientist, street, and sarcastic_robot; command-only
   sarcastic alias never enters API/Redis.
-- [ ] GET /api/admin/logs reads bounded history only for the allowed chat.
+- [x] GET /api/admin/logs reads bounded history only for the allowed chat.
   DELETE /api/admin/logs requires super-admin plus repeated UI confirmation,
   cancels non-terminal jobs, removes indexed private job snapshots/answers, and
   purges history. It accepts no arbitrary chat_id. QStash callback for a
   deleted/cancelled job returns terminal 2xx without side effects.
-- [ ] Every mutation uses typed JSON schema, rejects unknown fields, enforces
+- [x] Every mutation uses typed JSON schema, rejects unknown fields, enforces
   request-size limits, returns clear 4xx, and makes no partial write on
   validation failure.
 
@@ -179,10 +179,10 @@ form-action 'self' https://oauth.telegram.org
 
 ## Frontend in public/
 
-- [ ] Landing screen fetches /api/public/config, shows bot username, and links
+- [x] Landing screen fetches /api/public/config, shows bot username, and links
   “Log in with Telegram” to /api/auth/telegram/start.
-- [ ] After login, /api/admin/me determines role; 401 returns to login.
-- [ ] Implement sections:
+- [x] After login, /api/admin/me determines role; 401 returns to login.
+- [x] Implement sections:
   - **Users and lists:** observed search, numeric ID/username entry, membership,
     title/enabled/priority/applies_to/injected_prompt editing, super-admin role
     assignment.
@@ -194,9 +194,9 @@ form-action 'self' https://oauth.telegram.org
   - **Logs:** recent records, edit/reply/bot markers, and purge action.
   - **Privacy:** retention values, copyable participant notice, observed-profile
     deletion, and history purge.
-- [ ] Each mutation has loading/error/success state. Destructive actions require
+- [x] Each mutation has loading/error/success state. Destructive actions require
   explicit confirmation and reread server state after success.
-- [ ] Distinguish 401/403: expired/revoked session prompts login; inadequate role
+- [x] Distinguish 401/403: expired/revoked session prompts login; inadequate role
   is not shown as a generic network error.
 
 ## Privacy lifecycle
@@ -221,23 +221,23 @@ form-action 'self' https://oauth.telegram.org
 
 ## Automated checks
 
-- [ ] OIDC state one-time/expiry/mismatch, missing/wrong/swapped browser-binding
+- [x] OIDC state one-time/expiry/mismatch, missing/wrong/swapped browser-binding
   cookie, login CSRF/session swapping, atomic consume, PKCE S256, minimal scope,
   token-exchange errors, JWKS rotation, bad algorithm/signature/issuer/audience/
   nonce, future issued-at, expiry, and distinct sub versus numeric Telegram id.
-- [ ] Session fixed HS256 allowlist; reject none/algorithm confusion; canonical
+- [x] Session fixed HS256 allowlist; reject none/algorithm confusion; canonical
   sub and tg_user_id; issuer/audience/expiry/JTI/server record; logout,
   CSRF/origin, immediate admin removal, and super-admin invariant.
-- [ ] Missing SUPER_ADMIN_ID fails production readiness. Empty Redis admins still
+- [x] Missing SUPER_ADMIN_ID fails production readiness. Empty Redis admins still
   permits configured super-admin login.
-- [ ] Public config excludes secrets. Never serialize all Settings.
-- [ ] Username known/current, unknown 422, rename/stale alias, collision-safe
+- [x] Public config excludes secrets. Never serialize all Settings.
+- [x] Username known/current, unknown 422, rename/stale alias, collision-safe
   cleanup, unseen numeric list member, unseen numeric group member may become
   admin through getChatMember, and non-member refusal.
-- [ ] CRUD validation/authorization, allowed-group membership recheck,
+- [x] CRUD validation/authorization, allowed-group membership recheck,
   deterministic entities, reserved ignore, judge_default_n, no arbitrary chat ID,
   user/chat purge cancellation, snapshot erase, and outbound history cleanup.
-- [ ] DOM/XSS fixtures with script/event/malicious URL strings, CSP/security/cache
+- [x] DOM/XSS fixtures with script/event/malicious URL strings, CSP/security/cache
   headers, and Ticket 01–04 regression suite/Ruff/Python 3.12 CI.
 
 ## Live E2E acceptance

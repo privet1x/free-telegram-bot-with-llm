@@ -18,6 +18,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 _MAX_PROMPT_CHARS = 8_000
 COMMAND_RECEIPT_SECONDS = 2_592_000
+_UNSET = object()
 
 
 def config_key(chat_id: int) -> str:
@@ -102,23 +103,23 @@ def set_tone(
     *,
     tone_mode: str = "preset",
     tone_preset: str = "neutral",
-    custom_system_prompt: str | None = None,
+    custom_system_prompt: str | None | object = _UNSET,
     chat_id: int | None = None,
-    judge_default_n: int = 20,
+    judge_default_n: int | object = _UNSET,
 ) -> dict[str, Any]:
     if scope not in {"global", "chat"}:
         raise ValueError("scope must be global or chat")
     if scope == "chat" and chat_id is None:
         raise ValueError("chat scope requires chat_id")
-    if scope == "chat":
-        current = get_config(chat_id)["effective"]
-        if custom_system_prompt is None:
-            custom_system_prompt = current["custom_system_prompt"]
+    current = get_config(chat_id)["effective"] if scope == "chat" else (
+        _read(GLOBAL_CONFIG_KEY) or dict(DEFAULT_CONFIG)
+    )
+    prompt_supplied = custom_system_prompt is not _UNSET
+    judge_supplied = judge_default_n is not _UNSET
+    if not prompt_supplied:
+        custom_system_prompt = current["custom_system_prompt"]
+    if not judge_supplied:
         judge_default_n = current["judge_default_n"]
-    elif custom_system_prompt is None:
-        custom_system_prompt = (_read(GLOBAL_CONFIG_KEY) or DEFAULT_CONFIG)[
-            "custom_system_prompt"
-        ]
     value = validate_config(
         {
             "tone_mode": tone_mode,
@@ -129,8 +130,10 @@ def set_tone(
     )
     if scope == "chat":
         partial = {"tone_mode": tone_mode, "tone_preset": tone_preset}
-        if tone_mode == "custom":
+        if prompt_supplied or tone_mode == "custom":
             partial["custom_system_prompt"] = custom_system_prompt
+        if judge_supplied:
+            partial["judge_default_n"] = judge_default_n
         get_store().set(config_key(chat_id), json.dumps(partial, separators=(",", ":")))
         return value
     return _write(GLOBAL_CONFIG_KEY, value)
@@ -197,8 +200,15 @@ if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
 if ARGV[1] == '' then
   redis.call('DEL', KEYS[1])
 else
-  local raw = redis.call('GET', KEYS[1])
-  local value = raw and cjson.decode(raw) or {tone_mode='preset', tone_preset='neutral', custom_system_prompt=cjson.null, judge_default_n=20}
+local raw = redis.call('GET', KEYS[1])
+local value
+if raw then
+  value = cjson.decode(raw)
+elseif ARGV[4] == 'global' then
+  value = {tone_mode='preset', tone_preset='neutral', custom_system_prompt=cjson.null, judge_default_n=20}
+else
+  value = {}
+end
   local patch = cjson.decode(ARGV[1])
   value['tone_mode'] = patch['tone_mode']
   value['tone_preset'] = patch['tone_preset']
@@ -213,7 +223,7 @@ return 1
             "eval",
             script,
             keys=[target_key, command_key, dedup_key],
-            args=[encoded, str(COMMAND_RECEIPT_SECONDS), "86400"],
+            args=[encoded, str(COMMAND_RECEIPT_SECONDS), "86400", scope],
         )
     )
 

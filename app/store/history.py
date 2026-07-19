@@ -37,6 +37,12 @@ def upsert(chat_id: int, record: dict) -> None:
         ex=settings.HISTORY_RETENTION_SECONDS,
         prune_field="ts",
         min_value=int(time.time()) - settings.HISTORY_RETENTION_SECONDS,
+        block_key=(
+            f"privacy:job:{record['source_update_id']}"
+            if isinstance(record.get("source_update_id"), int)
+            and not isinstance(record.get("source_update_id"), bool)
+            else None
+        ),
     )
 
 
@@ -70,3 +76,24 @@ def recent(chat_id: int, n: int = HISTORY_LIMIT) -> list[dict]:
         ):
             out.append(decoded)
     return out[:n]
+
+
+def purge_user(
+    chat_id: int, user_id: int, outbound_message_ids: set[int] | None = None
+) -> int:
+    """Remove authored/private-derived records and redact replies atomically."""
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+        raise ValueError("user_id must be positive")
+    return get_store().list_privacy_filter(
+        history_key(chat_id), user_id, outbound_message_ids or set()
+    )
+
+
+def purge_all(chat_id: int) -> bool:
+    return bool(get_store().delete(history_key(chat_id)))
+
+
+def remove_message_ids(chat_id: int, message_ids: set[int]) -> int:
+    if not message_ids:
+        return len(recent(chat_id))
+    return get_store().list_remove_message_ids(history_key(chat_id), message_ids)

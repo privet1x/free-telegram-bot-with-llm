@@ -132,6 +132,10 @@ Critical invariants:
 | adminver:<user_id> | integer | Role/session version, incremented on role change |
 | auth:state:<hash> | JSON string, 10m | One-time OIDC state, nonce, verifier, browser-binding hash, exact redirect URI |
 | session:<jti> | JSON string, ≤8h | Server-side session record |
+| member:<chat_id>:<user_id> | JSON string, ≤5m | Positive assigned-admin group-membership cache |
+| auth:rate:<purpose>:<hash> | integer, 60s | Privacy-preserving per-address OIDC route rate limit |
+| privacy:job:<job_id> | string, ≤job TTL | Deletion tombstone that atomically blocks late history writes |
+| privacy:receipt:<index_hash> | set, ≤job retention | Retry-safe outbound message IDs retained until privacy cleanup succeeds |
 | lists:index | set | List slugs |
 | list:<slug>:meta | JSON string | Deterministic list metadata |
 | list:<slug>:members | set | Numeric user IDs |

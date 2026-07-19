@@ -683,6 +683,31 @@ redis.call('EXPIREAT', KEYS[1], expires_at)
 return expires_at - now
 """
 
+_PURGE_LUA = r"""
+if redis.call('EXISTS', KEYS[1]) == 0 then return nil end
+local snapshot = redis.call('HGETALL', KEYS[1])
+local has_receipt = false
+for index = 1, #snapshot, 2 do
+    local name = snapshot[index]
+    if string.sub(name, 1, 11) == 'checkpoint:' then
+        local ok, checkpoint = pcall(cjson.decode, snapshot[index + 1])
+        if ok and type(checkpoint) == 'table' and type(checkpoint['message_id']) == 'number' and checkpoint['message_id'] > 0 then
+            redis.call('SADD', KEYS[4], tostring(checkpoint['message_id']))
+            has_receipt = true
+        end
+    end
+end
+if has_receipt then redis.call('EXPIRE', KEYS[4], ARGV[2]) end
+local fence = tonumber(redis.call('HGET', KEYS[1], 'fence') or '0') + 1
+redis.call('HSET', KEYS[1], 'state', 'cancelled', 'fence', tostring(fence))
+redis.call('DEL', KEYS[1], KEYS[2], KEYS[3])
+for index = 5, #KEYS do
+    redis.call('ZREM', KEYS[index], ARGV[1])
+    if redis.call('ZCARD', KEYS[index]) == 0 then redis.call('DEL', KEYS[index]) end
+end
+return snapshot
+"""
+
 _JOB_TTL_LUA = (
     _BASE_LUA
     + r"""
@@ -1113,6 +1138,27 @@ class UpstashJobBackend:
         if not isinstance(result, (list, tuple)):
             raise RuntimeError("invalid Redis script response")
         return [_text(item) for item in result]
+
+    def purge(
+        self,
+        job_id: str,
+        *,
+        index_keys: Sequence[str],
+        receipt_key: str,
+        receipt_ttl: int,
+        now: int,
+    ) -> dict[str, str] | None:
+        return _hash_result(
+            self._eval(
+                _PURGE_LUA,
+                keys=[
+                    *_job_keys(job_id),
+                    receipt_key,
+                    *sorted(set(index_keys)),
+                ],
+                args=[job_id, str(receipt_ttl)],
+            )
+        )
 
     def ttl(self, key: str, *, now: int) -> int:
         failure_suffix = ":failure-lease"

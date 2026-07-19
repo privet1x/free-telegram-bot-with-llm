@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
-from app.settings import settings
-from app.store import lists, rules
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.settings import settings  # noqa: E402
+from app.store import lists, rules  # noqa: E402
 
 
 def main() -> int:
@@ -17,7 +22,7 @@ def main() -> int:
         print("TELEGRAM_ALLOWED_CHAT_ID is required", file=sys.stderr)
         return 1
     try:
-        lists.create(
+        list_records = [
             {
                 "slug": "ignore",
                 "title": "Ignore automatic replies",
@@ -26,9 +31,6 @@ def main() -> int:
                 "applies_to": ["auto"],
                 "injected_prompt": "",
             },
-            force=args.force,
-        )
-        lists.create(
             {
                 "slug": "aggressive",
                 "title": "Sarcastic response",
@@ -37,10 +39,13 @@ def main() -> int:
                 "applies_to": ["explicit", "auto", "judge"],
                 "injected_prompt": "Use dry sarcasm without personal attacks.",
             },
-            force=args.force,
-        )
-        rules.create(
-            {
+        ]
+        for item in list_records:
+            if lists.get(item["slug"]) is None:
+                lists.create(item, force=item["slug"] == lists.IGNORE_SLUG)
+            elif args.force:
+                lists.create(item, force=True)
+        rule_record = {
                 "id": "nonsense",
                 "enabled": True,
                 "priority": 50,
@@ -48,9 +53,9 @@ def main() -> int:
                 "match": {"type": "substring", "value": "nonsense"},
                 "instruction": "Explain calmly why the argument is not nonsense.",
                 "stop_processing": False,
-            },
-            force=args.force,
-        )
+            }
+        if rules.get(rule_record["id"]) is None or args.force:
+            rules.create(rule_record, force=args.force)
     except Exception as exc:
         print(f"seed failed: {type(exc).__name__}", file=sys.stderr)
         return 1

@@ -32,23 +32,17 @@ def list_admins() -> list[int]:
 
 
 def add_admin(user_id: int) -> bool:
-    normalized = _validate_user_id(user_id)
-    changed = bool(get_store().sadd(ADMINS_KEY, normalized))
-    if changed:
-        current = get_store().get(_version_key(user_id))
-        get_store().set(_version_key(user_id), str(int(current or "0") + 1))
-    return changed
+    _validate_user_id(user_id)
+    if settings.SUPER_ADMIN_ID == user_id:
+        return False
+    return get_store().admin_role_change(user_id, add=True)
 
 
 def remove_admin(user_id: int) -> bool:
-    normalized = _validate_user_id(user_id)
+    _validate_user_id(user_id)
     if settings.SUPER_ADMIN_ID == user_id:
         raise ValueError("super-admin cannot be removed")
-    changed = bool(get_store().srem(ADMINS_KEY, normalized))
-    if changed:
-        current = get_store().get(_version_key(user_id))
-        get_store().set(_version_key(user_id), str(int(current or "0") + 1))
-    return changed
+    return get_store().admin_role_change(user_id, add=False)
 
 
 def admin_version(user_id: int) -> int:

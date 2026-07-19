@@ -12,6 +12,7 @@ from typing import Literal
 
 from app.settings import Settings, settings
 from app.store.job_backend import JobBackend, MemoryJobBackend, utc_now
+from app.store.redis import get_store
 
 JobState = Literal[
     "received",
@@ -135,12 +136,35 @@ class FailureNoticeClaim:
     retry_after: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PurgeResult:
+    job_count: int
+    outbound_message_ids: set[int]
+
+
 def job_key(job_id: str | int) -> str:
     return f"job:{_job_id(job_id)}"
 
 
 def lease_key(job_id: str | int) -> str:
     return f"{job_key(job_id)}:lease"
+
+
+def privacy_receipt_key(index_key: str) -> str:
+    digest = hashlib.sha256(index_key.encode("utf-8")).hexdigest()
+    return f"privacy:receipt:{digest}"
+
+
+def _checkpoint_message_ids(raw: Mapping[str, str]) -> set[int]:
+    result: set[int] = set()
+    for name, value in raw.items():
+        if not name.startswith("checkpoint:"):
+            continue
+        checkpoint = _decode_object(value)
+        message_id = checkpoint.get("message_id") if checkpoint else None
+        if isinstance(message_id, int) and not isinstance(message_id, bool):
+            result.add(message_id)
+    return result
 
 
 def failure_lease_key(job_id: str | int) -> str:
@@ -312,6 +336,7 @@ class JobRepository:
         indexes = [chat_index_key(chat_id)] + [
             user_index_key(user_id) for user_id in sorted(normalized_users)
         ]
+        fields["index_keys_json"] = _json(sorted(indexes))
         if auto_cooldown_owner is not None:
             if auto_cooldown_seconds is None or auto_cooldown_seconds <= 0:
                 raise ValueError("auto cooldown is invalid")
@@ -711,6 +736,67 @@ class JobRepository:
             index_key, now=utc_now() if now is None else now
         )
 
+    def purge_index(
+        self, index_key: str, *, now: int | None = None
+    ) -> PurgeResult:
+        """Erase every indexed private job and report delivery artifacts."""
+        current_time = utc_now() if now is None else now
+        store = get_store()
+        receipt_key = privacy_receipt_key(index_key)
+        outbound_ids = {
+            int(value)
+            for value in store.smembers(receipt_key)
+            if value.isdecimal() and int(value) > 0
+        }
+        purged_jobs = 0
+        for job_id in self.index_job_ids(index_key, now=current_time):
+            job = self.get(job_id, now=current_time)
+            if job is None:
+                continue
+            raw_indexes = job.raw.get("index_keys_json")
+            try:
+                decoded_indexes = json.loads(raw_indexes) if raw_indexes else []
+            except (TypeError, ValueError):
+                decoded_indexes = []
+            indexes = {
+                value for value in decoded_indexes if isinstance(value, str) and value
+            }
+            if not indexes:
+                chat_id = job.request.get("chat_id")
+                if isinstance(chat_id, int) and not isinstance(chat_id, bool):
+                    indexes.add(chat_index_key(chat_id))
+                indexes.update(
+                    user_index_key(user_id)
+                    for user_id in _request_user_ids(job.request)
+                )
+            known_ids = _checkpoint_message_ids(job.raw)
+            if known_ids:
+                stored = store.set_add_expiring(
+                    receipt_key,
+                    {str(value) for value in known_ids},
+                    self._config.JOB_RETENTION_SECONDS,
+                )
+                outbound_ids.update(
+                    int(value) for value in stored if value.isdecimal()
+                )
+            store.set(
+                f"privacy:job:{job_id}",
+                "purged",
+                ex=max(job.expires_at - current_time, 1),
+            )
+            snapshot = self._backend.purge(
+                job_id,
+                index_keys=sorted(indexes),
+                receipt_key=receipt_key,
+                receipt_ttl=self._config.JOB_RETENTION_SECONDS,
+                now=current_time,
+            )
+            if snapshot is not None:
+                purged_jobs += 1
+                snapshot_ids = _checkpoint_message_ids(snapshot)
+                outbound_ids.update(snapshot_ids)
+        return PurgeResult(purged_jobs, outbound_ids)
+
     def ttl(self, key: str, *, now: int | None = None) -> int:
         return self._backend.ttl(key, now=utc_now() if now is None else now)
 
@@ -726,6 +812,20 @@ def _validate_intent_name(name: str) -> None:
         )
     ):
         raise ValueError("intent name is invalid")
+
+
+def _request_user_ids(value: object) -> set[int]:
+    result: set[int] = set()
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if key in {"user_id", "id"} and isinstance(item, int) and not isinstance(item, bool) and item > 0:
+                result.add(item)
+            else:
+                result.update(_request_user_ids(item))
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        for item in value:
+            result.update(_request_user_ids(item))
+    return result
 
 
 _repository: JobRepository | None = None

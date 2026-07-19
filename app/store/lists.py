@@ -89,10 +89,15 @@ def create(value: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
     item = _validate(value)
     if item["slug"] == IGNORE_SLUG and not force:
         raise ValueError("ignore is reserved")
-    if get(item["slug"]) is not None and not force:
+    status = get_store().indexed_json_put(
+        LISTS_INDEX_KEY,
+        _key(item["slug"]),
+        item["slug"],
+        json.dumps(item, ensure_ascii=False, separators=(",", ":")),
+        create_only=not force,
+    )
+    if status == "exists":
         raise ValueError("list already exists")
-    get_store().set(_key(item["slug"]), json.dumps(item, separators=(",", ":")))
-    get_store().sadd(LISTS_INDEX_KEY, item["slug"])
     return item
 
 
@@ -104,22 +109,47 @@ def update(slug: str, value: dict[str, Any]) -> dict[str, Any]:
         raise KeyError(slug)
     candidate = dict(current)
     candidate.update(value)
-    candidate["slug"] = slug
-    return create(candidate, force=True)
+    new_slug = value.get("slug", slug)
+    if new_slug == IGNORE_SLUG:
+        raise ValueError("ignore is reserved")
+    candidate["slug"] = new_slug
+    item = _validate(candidate)
+    status = get_store().rename_indexed_set(
+        LISTS_INDEX_KEY,
+        _key(slug),
+        _key(item["slug"]),
+        f"list:{_slug(slug)}:members",
+        f"list:{item['slug']}:members",
+        slug,
+        item["slug"],
+        json.dumps(item, ensure_ascii=False, separators=(",", ":")),
+    )
+    if status == "missing":
+        raise KeyError(slug)
+    if status == "exists":
+        raise ValueError("list already exists")
+    return item
 
 
 def delete(slug: str) -> bool:
     if slug == IGNORE_SLUG:
         raise ValueError("ignore is reserved")
-    removed = get_store().delete(_key(slug), f"list:{_slug(slug)}:members")
-    get_store().srem(LISTS_INDEX_KEY, slug)
+    removed = get_store().list_delete(
+        LISTS_INDEX_KEY,
+        _key(slug),
+        f"list:{_slug(slug)}:members",
+        slug,
+    )
     return bool(removed)
 
 
 def add_member(slug: str, user_id: int) -> bool:
-    if get(slug) is None:
+    status = get_store().list_member_add(
+        _key(slug), f"list:{_slug(slug)}:members", _user(user_id)
+    )
+    if status == "missing":
         raise KeyError(slug)
-    return bool(get_store().sadd(f"list:{_slug(slug)}:members", _user(user_id)))
+    return status == "added"
 
 
 def remove_member(slug: str, user_id: int) -> bool:
@@ -128,6 +158,28 @@ def remove_member(slug: str, user_id: int) -> bool:
 
 def is_member(slug: str, user_id: int) -> bool:
     return get_store().sismember(f"list:{_slug(slug)}:members", _user(user_id))
+
+
+def member_ids(slug: str) -> list[int]:
+    if get(slug) is None:
+        raise KeyError(slug)
+    result: list[int] = []
+    for raw in get_store().smembers(f"list:{_slug(slug)}:members"):
+        try:
+            user_id = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if user_id > 0:
+            result.append(user_id)
+    return sorted(set(result))
+
+
+def remove_user_from_all(user_id: int) -> int:
+    member = _user(user_id)
+    return sum(
+        get_store().srem(f"list:{item['slug']}:members", member)
+        for item in all_lists()
+    )
 
 
 def member_lists(user_id: int, kind: str) -> list[dict[str, Any]]:

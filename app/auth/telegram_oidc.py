@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import secrets
 from urllib.parse import urlencode
 
@@ -18,6 +19,8 @@ def _b64(value: bytes) -> str:
 
 
 def create_state(redirect_uri: str) -> tuple[str, str, str, str]:
+    if not isinstance(redirect_uri, str) or not redirect_uri.startswith("https://"):
+        raise ValueError("invalid redirect URI")
     state = _b64(secrets.token_bytes(32))
     handle = _b64(secrets.token_bytes(32))
     verifier = _b64(secrets.token_bytes(32))
@@ -25,7 +28,17 @@ def create_state(redirect_uri: str) -> tuple[str, str, str, str]:
     nonce = _b64(secrets.token_bytes(32))
     get_store().set(
         f"auth:state:{hashlib.sha256(state.encode()).hexdigest()}",
-        f"{hashlib.sha256(handle.encode()).hexdigest()}:{verifier}:{redirect_uri}:{nonce}",
+        json.dumps(
+            {
+                "handle_hash": hashlib.sha256(handle.encode()).hexdigest(),
+                "verifier": verifier,
+                "redirect_uri": redirect_uri,
+                "nonce": nonce,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
         ex=STATE_TTL,
     )
     return state, handle, challenge, nonce
@@ -38,13 +51,37 @@ def authorization_url(state: str, challenge: str, redirect_uri: str, nonce: str 
 
 
 def consume_state(state: str, handle: str, redirect_uri: str) -> tuple[str, str, str]:
+    if any(
+        not isinstance(value, str) or not value or len(value) > 2_048
+        for value in (state, handle, redirect_uri)
+    ):
+        raise ValueError("invalid state")
     key = f"auth:state:{hashlib.sha256(state.encode()).hexdigest()}"
-    raw = get_store().get(key)
+    store = get_store()
+    raw = store.get(key)
     if raw is None:
         raise ValueError("invalid state")
-    parts = raw.split(":", 3)
-    if len(parts) != 4 or not secrets.compare_digest(parts[0], hashlib.sha256(handle.encode()).hexdigest()) or parts[2] != redirect_uri:
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        raise ValueError("invalid state") from None
+    verifier = value.get("verifier") if isinstance(value, dict) else None
+    nonce = value.get("nonce") if isinstance(value, dict) else None
+    saved_handle_hash = value.get("handle_hash") if isinstance(value, dict) else None
+    saved_redirect_uri = value.get("redirect_uri") if isinstance(value, dict) else None
+    if (
+        not isinstance(saved_handle_hash, str)
+        or not secrets.compare_digest(
+            saved_handle_hash, hashlib.sha256(handle.encode()).hexdigest()
+        )
+        or not isinstance(saved_redirect_uri, str)
+        or not secrets.compare_digest(saved_redirect_uri, redirect_uri)
+        or not isinstance(verifier, str)
+        or not verifier
+        or not isinstance(nonce, str)
+        or not nonce
+    ):
         raise ValueError("invalid state")
-    if not get_store().delete_if_value(key, raw):
+    if not store.delete_if_value(key, raw):
         raise ValueError("state already consumed")
-    return parts[1], parts[2], parts[3]
+    return verifier, redirect_uri, nonce

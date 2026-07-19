@@ -91,6 +91,7 @@ settings = Settings()
 
 _WEBHOOK_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
 _EXPECTED_FLASH_MODEL = "deepseek-ai/deepseek-v4-flash"
+_EXPECTED_SMART_MODEL = "deepseek-ai/deepseek-v4-pro"
 _VERCEL_MAX_DURATION_SECONDS = 300
 
 
@@ -104,6 +105,21 @@ def _is_https_base_url(value: str) -> bool:
         and parsed.path in {"", "/"}
         and not parsed.query
         and not parsed.fragment
+    )
+
+
+def session_secret_is_safe(value: str) -> bool:
+    """Reject short and obviously degenerate session-signing secrets."""
+    return bool(
+        isinstance(value, str)
+        and len(value.encode("utf-8")) >= 32
+        and len(set(value)) >= 8
+        and value.casefold()
+        not in {
+            "replace_me",
+            "change_me",
+            "your_session_secret",
+        }
     )
 
 
@@ -149,7 +165,7 @@ def production_config_errors(config: Settings = settings) -> list[str]:
     errors.extend(name for name, value in required.items() if not value)
     if not isinstance(config.SUPER_ADMIN_ID, int) or isinstance(config.SUPER_ADMIN_ID, bool) or config.SUPER_ADMIN_ID <= 0:
         errors.append("SUPER_ADMIN_ID")
-    if len(config.SESSION_SECRET.encode()) < 32:
+    if not session_secret_is_safe(config.SESSION_SECRET):
         errors.append("SESSION_SECRET")
     if not config.TELEGRAM_OIDC_CLIENT_ID:
         errors.append("TELEGRAM_OIDC_CLIENT_ID")
@@ -158,6 +174,8 @@ def production_config_errors(config: Settings = settings) -> list[str]:
 
     if config.LLM_MODEL_FAST != _EXPECTED_FLASH_MODEL:
         errors.append("LLM_MODEL_FAST")
+    if config.LLM_MODEL_SMART != _EXPECTED_SMART_MODEL:
+        errors.append("LLM_MODEL_SMART")
     if config.QSTASH_URL and not _is_https_base_url(config.QSTASH_URL):
         errors.append("QSTASH_URL")
 

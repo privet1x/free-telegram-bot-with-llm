@@ -36,11 +36,16 @@ def sanitize_query(query: str, forbidden_terms: tuple[str, ...] = ()) -> str | N
         return None
     value = " ".join(query.split())[:MAX_QUERY_CHARS]
     lowered = value.casefold()
-    if not value or _IDENTIFIER.search(value) or any(
-        term.strip().casefold() and term.strip().casefold() in lowered
-        for term in forbidden_terms
-    ):
+    if not value or _IDENTIFIER.search(value):
         return None
+    for term in forbidden_terms:
+        private = " ".join(term.split()).casefold()
+        if not private:
+            continue
+        if private in lowered:
+            return None
+        if len(lowered) >= 4 and lowered in private:
+            return None
     return value
 
 
@@ -113,9 +118,11 @@ async def search(
         result.append(
             SearchSource(
                 source_id=f"S{len(result) + 1}",
-                title=str(item.get("title") or "")[:256],
+                title=" ".join(str(item.get("title") or "").split())[:256],
                 url=url[:2_048],
-                snippet=str(item.get("content") or item.get("snippet") or "")[:1_000],
+                snippet=" ".join(
+                    str(item.get("content") or item.get("snippet") or "").split()
+                )[:1_000],
             )
         )
     return result

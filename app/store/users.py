@@ -80,3 +80,15 @@ def resolve_username(username: str) -> Optional[dict[str, Any]]:
     if record is None or normalize_username(record.get("username")) != normalized:
         return None
     return record
+
+
+def delete(user_id: int) -> bool:
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+        raise ValueError("user_id must be positive")
+    return get_store().delete_user_alias(user_id)
+
+
+def delete_with_memberships(user_id: int) -> tuple[bool, int]:
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+        raise ValueError("user_id must be positive")
+    return get_store().delete_user_data(user_id)

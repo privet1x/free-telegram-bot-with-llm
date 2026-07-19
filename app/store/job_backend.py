@@ -14,6 +14,8 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Protocol
 
+from app.store.redis import get_store
+
 TERMINAL_STATES = frozenset({"delivered", "failed", "failed_ambiguous", "cancelled"})
 PROCESSABLE_STATES = frozenset(
     {"received", "enqueued", "failed_retryable", "processing", "ready_to_deliver"}
@@ -190,6 +192,16 @@ class JobBackend(Protocol):
     ) -> bool: ...
 
     def index_members(self, index_key: str, *, now: int) -> list[str]: ...
+
+    def purge(
+        self,
+        job_id: str,
+        *,
+        index_keys: Sequence[str],
+        receipt_key: str,
+        receipt_ttl: int,
+        now: int,
+    ) -> dict[str, str] | None: ...
 
     def ttl(self, key: str, *, now: int) -> int: ...
 
@@ -766,6 +778,59 @@ class MemoryJobBackend:
                     values.items(), key=lambda item: (item[1], item[0])
                 )
             ]
+
+    def purge(
+        self,
+        job_id: str,
+        *,
+        index_keys: Sequence[str],
+        receipt_key: str,
+        receipt_ttl: int,
+        now: int,
+    ) -> dict[str, str] | None:
+        """Cancel and erase a private job snapshot and all known indexes."""
+        with self._lock:
+            job = self._job(job_id, now)
+            if job is None:
+                return None
+            snapshot = copy.deepcopy(job)
+            outbound_ids: set[str] = set()
+            for name, raw in snapshot.items():
+                if not name.startswith("checkpoint:"):
+                    continue
+                try:
+                    checkpoint = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                message_id = (
+                    checkpoint.get("message_id")
+                    if isinstance(checkpoint, dict)
+                    else None
+                )
+                if (
+                    isinstance(message_id, int)
+                    and not isinstance(message_id, bool)
+                    and message_id > 0
+                ):
+                    outbound_ids.add(str(message_id))
+            if outbound_ids:
+                get_store().set_add_expiring(
+                    receipt_key, outbound_ids, receipt_ttl
+                )
+            job["state"] = "cancelled"
+            job["fence"] = str(_integer(job, "fence") + 1)
+            self._leases.pop(job_id, None)
+            self._notice_leases.pop(job_id, None)
+            self._jobs.pop(job_id, None)
+            self._job_expiry.pop(job_id, None)
+            for key in set(index_keys) | set(self._indexes):
+                values = self._indexes.get(key)
+                if values is not None:
+                    values.pop(job_id, None)
+                    if not values:
+                        self._indexes.pop(key, None)
+                        self._index_expiry.pop(key, None)
+            return snapshot
 
     def ttl(self, key: str, *, now: int) -> int:
         with self._lock:

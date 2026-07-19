@@ -43,6 +43,8 @@ def _validate(value: dict[str, Any]) -> dict[str, Any]:
     match_value = match.get("value")
     if not isinstance(match_value, str) or not normalize_text(match_value):
         raise ValueError("match.value is invalid")
+    if match.get("type") == "word" and len(normalize_text(match_value).split()) != 1:
+        raise ValueError("word match requires exactly one token")
     if scope not in _SCOPES:
         raise ValueError("scope is invalid")
     if not isinstance(instruction, str) or not instruction.strip() or len(instruction) > _MAX_INSTRUCTION:
@@ -83,15 +85,23 @@ def all_rules() -> list[dict[str, Any]]:
         item = get(rule_id)
         if item is not None:
             result.append(item)
-    return result
+    return sorted(
+        result,
+        key=lambda item: (-int(item.get("priority", 0)), str(item.get("id", ""))),
+    )
 
 
 def create(value: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
     item = _validate(value)
-    if get(item["id"]) is not None and not force:
+    status = get_store().indexed_json_put(
+        RULES_INDEX_KEY,
+        _key(item["id"]),
+        item["id"],
+        json.dumps(item, ensure_ascii=False, separators=(",", ":")),
+        create_only=not force,
+    )
+    if status == "exists":
         raise ValueError("rule already exists")
-    get_store().set(_key(item["id"]), json.dumps(item, ensure_ascii=False, separators=(",", ":")))
-    get_store().sadd(RULES_INDEX_KEY, item["id"])
     return item
 
 
@@ -106,8 +116,7 @@ def update(rule_id: str, value: dict[str, Any]) -> dict[str, Any]:
 
 
 def delete(rule_id: str) -> bool:
-    removed = get_store().delete(_key(rule_id))
-    get_store().srem(RULES_INDEX_KEY, rule_id)
+    removed = get_store().indexed_delete(RULES_INDEX_KEY, _key(rule_id), rule_id)
     return bool(removed)
 
 

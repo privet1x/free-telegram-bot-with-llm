@@ -53,6 +53,36 @@ def test_upstash_failure_takeover_passes_callback_retry_policy():
     assert redis.calls[-1][2][-1] == "4"
 
 
+def test_upstash_privacy_purge_returns_snapshot_and_removes_all_indexes_atomically():
+    redis = _RecordingRedis(
+        ["state", "processing", "checkpoint:placeholder", '{"message_id":9001}']
+    )
+    backend = _backend(redis)
+
+    result = backend.purge(
+        "job-1",
+        index_keys=["jobs:chat:-100", "jobs:user:42"],
+        receipt_key="privacy:receipt:test",
+        receipt_ttl=604_800,
+        now=100,
+    )
+
+    assert result == {
+        "state": "processing",
+        "checkpoint:placeholder": '{"message_id":9001}',
+    }
+    script, keys, args = redis.calls[-1]
+    assert script.index("HGETALL") < script.index("DEL")
+    assert "ZREM" in script
+    assert keys[-3:] == [
+        "privacy:receipt:test",
+        "jobs:chat:-100",
+        "jobs:user:42",
+    ]
+    assert "SADD" in script and "EXPIRE" in script
+    assert args == ["job-1", "604800"]
+
+
 def test_upstash_client_lock_has_a_bounded_wait(monkeypatch: pytest.MonkeyPatch):
     redis = _RecordingRedis()
     backend = _backend(redis)

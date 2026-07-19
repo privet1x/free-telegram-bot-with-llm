@@ -49,7 +49,7 @@ def _ticket_02_settings(**overrides):
         "QSTASH_CURRENT_SIGNING_KEY": "current-key",
         "QSTASH_NEXT_SIGNING_KEY": "next-key",
         "SUPER_ADMIN_ID": 5,
-        "SESSION_SECRET": "x" * 32,
+        "SESSION_SECRET": "0123456789abcdef" * 2,
         "TELEGRAM_OIDC_CLIENT_ID": "oidc-client",
         "TELEGRAM_OIDC_CLIENT_SECRET": "oidc-secret",
     }
@@ -68,6 +68,7 @@ def test_ticket_02_production_configuration_is_ready():
         ({"JOB_LEASE_SECONDS": 240}, "JOB_LEASE_SECONDS"),
         ({"JOB_LEASE_SECONDS": 300}, "JOB_LEASE_SECONDS"),
         ({"LLM_MODEL_FAST": "another-model"}, "LLM_MODEL_FAST"),
+        ({"LLM_MODEL_SMART": "another-model"}, "LLM_MODEL_SMART"),
         ({"QSTASH_URL": "http://qstash.example"}, "QSTASH_URL"),
         ({"QSTASH_CURRENT_SIGNING_KEY": ""}, "QSTASH_CURRENT_SIGNING_KEY"),
         ({"QSTASH_NEXT_SIGNING_KEY": ""}, "QSTASH_NEXT_SIGNING_KEY"),

@@ -31,7 +31,9 @@ def create_app() -> FastAPI:
         response.headers.setdefault("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data: https:; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://oauth.telegram.org")
         if os.environ.get("VERCEL"):
             response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-        if request.url.path.startswith(("/api/auth/", "/api/admin/")):
+        if request.url.path in {"/", "/index.html"} or request.url.path.startswith(
+            ("/api/auth/", "/api/admin/")
+        ):
             response.headers["Cache-Control"] = "no-store"
         return response
     application.include_router(webhook_router)

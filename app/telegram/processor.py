@@ -26,7 +26,8 @@ from app.llm.client import (
 from app.llm.prompts import build_judge_messages, build_reply_messages
 from app.llm.prompts import build_claim_messages
 from app.search.judge import validate_claims, validate_citations
-from app.search.tavily import TavilyUnavailable, search as tavily_search
+from app.search.tavily import TavilyUnavailable, sanitize_query
+from app.search.tavily import search as tavily_search
 from app.queue.qstash import (
     QStashVerificationError,
     failure_url,
@@ -199,6 +200,31 @@ def _request_int(job: JobRecord, name: str) -> int:
     return value
 
 
+def _private_search_terms(request: Mapping[str, object]) -> tuple[str, ...]:
+    """Collect identifiers and raw text that must not appear in Tavily queries."""
+    terms: list[str] = []
+
+    def add_record(value: object) -> None:
+        if not isinstance(value, Mapping):
+            return
+        for field in ("name", "username", "text", "user_id", "id"):
+            candidate = value.get(field)
+            if isinstance(candidate, str) and candidate.strip():
+                terms.append(candidate)
+            elif isinstance(candidate, int) and not isinstance(candidate, bool):
+                terms.append(str(candidate))
+        add_record(value.get("reply_to"))
+
+    add_record(request.get("author"))
+    add_record(request.get("trigger"))
+    add_record(request.get("reply_context"))
+    context = request.get("context")
+    if isinstance(context, list):
+        for record in context:
+            add_record(record)
+    return tuple(dict.fromkeys(terms))
+
+
 async def _history_upsert(
     job: JobRecord,
     result: Mapping[str, object],
@@ -206,7 +232,13 @@ async def _history_upsert(
     identity: BotIdentity,
     text: str,
     edited: bool,
+    repository: JobRepository | None = None,
+    lease: JobLease | None = None,
 ) -> None:
+    if (repository is None) != (lease is None):
+        raise ValueError("repository and lease must be provided together")
+    if repository is not None and lease is not None:
+        await _require_owned(repository, lease)
     chat_id = _request_int(job, "chat_id")
     record = telegram_client.outbound_history_record(
         dict(result),
@@ -217,6 +249,14 @@ async def _history_upsert(
         edited=edited,
     )
     await _sync(history.upsert, chat_id, record)
+    if repository is not None and lease is not None:
+        if not await _sync(repository.guard, lease):
+            await _sync(
+                history.remove_message_ids,
+                chat_id,
+                {int(record["message_id"])},
+            )
+            raise OwnershipLost()
 
 
 def _canonical_checkpoint(
@@ -404,6 +444,8 @@ async def _ensure_placeholder(
         identity=identity,
         text=PLACEHOLDER_TEXT,
         edited=False,
+        repository=repository,
+        lease=lease,
     )
     return checkpoint
 
@@ -457,6 +499,12 @@ async def _judge_answer(
         ambiguous_on_takeover=True,
     )
     claims: list[dict[str, str]]
+    if claims_intent.status == "ambiguous":
+        raise _AmbiguousWork("judge_claims_ambiguous")
+    if claims_intent.status == "conflict":
+        raise _PermanentWork("judge_claims_conflict")
+    if claims_intent.status == "ownership_lost":
+        raise OwnershipLost()
     if claims_intent.checkpoint is not None:
         try:
             claims = validate_claims(claims_intent.checkpoint)
@@ -467,69 +515,121 @@ async def _judge_answer(
         try:
             raw_claims = await generate_pro(build_claim_messages(job))
             claims = validate_claims(json.loads(raw_claims))
+        except LLMRetryableError:
+            await _sync(repository.clear_intent, lease, name="judge_claims")
+            raise
         except (json.JSONDecodeError, ValueError, TypeError):
             claims = []
         except TavilyUnavailable:
             claims = []
         await _sync(repository.checkpoint, lease, name="judge_claims", result={"claims": claims})
 
-    evidence_intent = await _sync(
-        repository.prepare_intent,
-        lease,
-        name="judge_evidence",
-        kind="judgeStage",
-        chunk_index=1,
-        payload_hash=hashlib.sha256(json.dumps(claims, sort_keys=True).encode()).hexdigest(),
-        ambiguous_on_takeover=False,
-    )
-    if evidence_intent.checkpoint is not None:
-        raw_evidence = evidence_intent.checkpoint.get("evidence", [])
-        if not isinstance(raw_evidence, list):
+    evidence: list[dict[str, str]] = []
+    forbidden_terms = _private_search_terms(job.request)
+    unverified_claims: list[dict[str, str]] = []
+    for claim_index, claim in enumerate(claims[: settings.FACT_CHECK_MAX_QUERIES]):
+        search_intent = await _sync(
+            repository.prepare_intent,
+            lease,
+            name=f"judge_search:{claim_index}",
+            kind="judgeStage",
+            chunk_index=claim_index + 1,
+            payload_hash=hashlib.sha256(
+                json.dumps(claim, sort_keys=True).encode()
+            ).hexdigest(),
+            ambiguous_on_takeover=True,
+        )
+        if search_intent.status == "ambiguous":
+            raise _AmbiguousWork("judge_search_ambiguous")
+        if search_intent.status == "conflict":
+            raise _PermanentWork("judge_search_conflict")
+        if search_intent.status == "ownership_lost":
+            raise OwnershipLost()
+        checkpoint = search_intent.checkpoint
+        if checkpoint is None:
+            await _require_owned(repository, lease)
+            safe_query = sanitize_query(claim["search_query"], forbidden_terms)
+            status = "verified"
+            if safe_query is None:
+                sources = []
+                status = "unverified_private"
+            else:
+                try:
+                    sources = await tavily_search(
+                        safe_query, forbidden_terms=forbidden_terms
+                    )
+                except TavilyUnavailable:
+                    sources = []
+                    status = "unverified_unavailable"
+                if not sources:
+                    status = "unverified_unavailable"
+            checkpoint = {
+                "status": status,
+                "sources": [
+                    {
+                        "title": source.title,
+                        "url": source.url,
+                        "snippet": source.snippet,
+                    }
+                    for source in sources
+                ]
+            }
+            await _sync(
+                repository.checkpoint,
+                lease,
+                name=f"judge_search:{claim_index}",
+                result=checkpoint,
+            )
+        raw_sources = checkpoint.get("sources")
+        status = checkpoint.get("status", "verified")
+        if (
+            not isinstance(raw_sources, list)
+            or status
+            not in {"verified", "unverified_private", "unverified_unavailable"}
+        ):
             raise _PermanentWork("judge_evidence_corrupt")
-        evidence = []
-        for item in raw_evidence:
+        if status != "verified":
+            unverified_claims.append(
+                {
+                    "claim_id": claim["claim_id"],
+                    "neutral_claim": claim["neutral_claim"],
+                    "status": str(status),
+                }
+            )
+        for source in raw_sources:
             if (
-                not isinstance(item, Mapping)
-                or not all(isinstance(item.get(field), str) for field in ("source_id", "title", "url", "snippet"))
-                or not str(item["url"]).startswith("https://")
+                not isinstance(source, Mapping)
+                or not all(
+                    isinstance(source.get(field), str)
+                    for field in ("title", "url", "snippet")
+                )
+                or not str(source["url"]).startswith("https://")
             ):
                 raise _PermanentWork("judge_evidence_corrupt")
-            evidence.append(dict(item))
-    else:
-        evidence: list[dict[str, str]] = []
-        forbidden_terms: tuple[str, ...] = tuple(
-            str(value)
-            for record in job.request.get("context", [])
-            if isinstance(record, Mapping)
-            for value in (record.get("name"), record.get("username"))
-            if isinstance(value, str) and value.strip()
-        )
-        for claim in claims[: settings.FACT_CHECK_MAX_QUERIES]:
-            try:
-                sources = await tavily_search(
-                    claim["search_query"], forbidden_terms=forbidden_terms
-                )
-            except TavilyUnavailable:
-                continue
-            evidence.extend(
+            evidence.append(
                 {
-                    "source_id": f"S{len(evidence) + index + 1}",
-                    "title": source.title,
-                    "url": source.url,
-                    "snippet": source.snippet,
+                    "source_id": f"S{len(evidence) + 1}",
+                    "claim_id": claim["claim_id"],
+                    "title": str(source["title"]),
+                    "url": str(source["url"]),
+                    "snippet": str(source["snippet"]),
                 }
-                for index, source in enumerate(sources)
             )
-        await _sync(repository.checkpoint, lease, name="judge_evidence", result={"evidence": evidence})
     verdict_intent = await _sync(
         repository.prepare_intent,
         lease,
         name="judge_verdict",
         kind="judgeStage",
-        chunk_index=2,
+        chunk_index=settings.FACT_CHECK_MAX_QUERIES + 1,
         payload_hash=hashlib.sha256(json.dumps(evidence, sort_keys=True).encode()).hexdigest(),
         ambiguous_on_takeover=True,
     )
+    if verdict_intent.status == "ambiguous":
+        raise _AmbiguousWork("judge_verdict_ambiguous")
+    if verdict_intent.status == "conflict":
+        raise _PermanentWork("judge_verdict_conflict")
+    if verdict_intent.status == "ownership_lost":
+        raise OwnershipLost()
     if verdict_intent.checkpoint is not None:
         raw_verdict = verdict_intent.checkpoint.get("text")
         if not isinstance(raw_verdict, str):
@@ -537,7 +637,15 @@ async def _judge_answer(
         verdict = raw_verdict
     else:
         await _require_owned(repository, lease)
-        verdict = await generate_pro(build_judge_messages(job, evidence=evidence))
+        try:
+            verdict = await generate_pro(
+                build_judge_messages(
+                    job, evidence=[*evidence, *unverified_claims]
+                )
+            )
+        except LLMRetryableError:
+            await _sync(repository.clear_intent, lease, name="judge_verdict")
+            raise
         await _sync(
             repository.checkpoint,
             lease,
@@ -552,6 +660,11 @@ async def _judge_answer(
         cleaned += "\n\nSources:\n" + "\n".join(
             f"{item['source_id']} — {item['title']} — {item['url']}"
             for item in evidence
+        )
+    if unverified_claims:
+        cleaned += "\n\nUnverified claims:\n" + "\n".join(
+            f"{item['claim_id']} — {item['status']}"
+            for item in unverified_claims
         )
     return cleaned
 
@@ -647,6 +760,8 @@ async def _edit_first_chunk(
         identity=identity,
         text=text,
         edited=True,
+        repository=repository,
+        lease=lease,
     )
 
 
@@ -717,6 +832,8 @@ async def _send_chunk(
         identity=identity,
         text=text,
         edited=False,
+        repository=repository,
+        lease=lease,
     )
 
 

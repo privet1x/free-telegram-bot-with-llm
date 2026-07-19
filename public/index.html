@@ -1,2 +1,103 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Kulajaj Admin</title><link rel="stylesheet" href="/styles.css"><script src="/app.js" defer></script></head><body><main><h1>Kulajaj Admin</h1><p id="status">Loading…</p><a id="login" href="/api/auth/telegram/start">Log in with Telegram</a><section id="admin" hidden><h2>Configuration</h2><p id="role"></p><button id="logout" type="button">Log out</button><h3>Tone</h3><pre id="tone"></pre><h3>Lists</h3><pre id="lists"></pre><h3>Rules</h3><pre id="rules"></pre><h3>Logs</h3><pre id="logs"></pre></section></main></body></html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kulajaj Admin</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header><h1>Kulajaj Admin</h1><p id="status">Loading configuration…</p></header>
+  <main>
+    <section id="login-panel">
+      <p>Configure the private-group bot through a Telegram administrator account.</p>
+      <a id="login" class="button" href="/api/auth/telegram/start">Log in with Telegram</a>
+    </section>
+
+    <div id="admin-panel" hidden>
+      <div class="session-bar"><span id="role"></span><button id="logout" type="button">Log out</button></div>
+      <nav aria-label="Admin sections">
+        <a href="#users">Users</a><a href="#admins">Admins</a><a href="#lists">Lists</a>
+        <a href="#rules">Rules</a><a href="#tone">Tone</a><a href="#logs">Logs</a><a href="#privacy">Privacy</a>
+      </nav>
+      <p id="feedback" role="status" aria-live="polite"></p>
+
+      <section id="users">
+        <h2>Observed users</h2>
+        <form id="user-search-form"><label>Exact Telegram ID or observed @username <input id="user-query" required maxlength="64"></label><button>Search</button></form>
+        <pre id="user-result">No search yet.</pre>
+      </section>
+
+      <section id="admins">
+        <h2>Administrators</h2>
+        <div id="admin-list"></div>
+        <form id="admin-form">
+          <label>Numeric Telegram ID <input id="admin-user-id" inputmode="numeric"></label>
+          <label>or observed @username <input id="admin-username" maxlength="64"></label>
+          <button>Add administrator</button>
+        </form>
+      </section>
+
+      <section id="lists">
+        <h2>Personal policy lists</h2>
+        <div id="list-items"></div>
+        <form id="list-form">
+          <input id="list-original-slug" type="hidden">
+          <label>Slug <input id="list-slug" required maxlength="64" pattern="[a-z0-9][a-z0-9_-]*"></label>
+          <label>Title <input id="list-title" required maxlength="256"></label>
+          <label>Priority <input id="list-priority" type="number" min="-1000" max="1000" value="0" required></label>
+          <label><input id="list-enabled" type="checkbox" checked> Enabled</label>
+          <fieldset><legend>Applies to</legend><label><input name="list-scope" type="checkbox" value="explicit" checked> Explicit</label><label><input name="list-scope" type="checkbox" value="auto"> Auto</label><label><input name="list-scope" type="checkbox" value="judge"> Judge</label></fieldset>
+          <label>Trusted injected prompt <textarea id="list-prompt" maxlength="8000" required></textarea></label>
+          <button>Save list</button><button id="list-reset" type="button">New list</button>
+        </form>
+        <form id="member-form"><h3>List membership</h3><label>List slug <input id="member-slug" required maxlength="64"></label><label>Numeric user ID or observed @username <input id="member-user-id" required maxlength="64"></label><button>Add member</button></form>
+      </section>
+
+      <section id="rules">
+        <h2>Text rules</h2>
+        <p>Preview order is priority descending, then ID ascending.</p>
+        <div id="rule-items"></div>
+        <form id="rule-form">
+          <input id="rule-original-id" type="hidden">
+          <label>ID <input id="rule-id" required maxlength="64" pattern="[a-z0-9][a-z0-9_-]*"></label>
+          <label>Match type <select id="rule-match-type"><option>substring</option><option>word</option><option>phrase</option></select></label>
+          <label>Match value <input id="rule-match-value" required maxlength="512"></label>
+          <label>Scope <select id="rule-scope"><option>all</option><option>explicit</option><option>auto</option><option>judge</option></select></label>
+          <label>Priority <input id="rule-priority" type="number" min="-1000" max="1000" value="0" required></label>
+          <label><input id="rule-enabled" type="checkbox" checked> Enabled</label>
+          <label><input id="rule-stop" type="checkbox"> Stop lower-priority groups</label>
+          <label>Trusted instruction <textarea id="rule-instruction" maxlength="8000" required></textarea></label>
+          <button>Save rule</button><button id="rule-reset" type="button">New rule</button>
+        </form>
+      </section>
+
+      <section id="tone">
+        <h2>Tone and judge defaults</h2>
+        <div class="config-grid"><div><h3>Global</h3><pre id="tone-global"></pre></div><div><h3>Chat override</h3><pre id="tone-chat"></pre></div><div><h3>Effective</h3><pre id="tone-effective"></pre></div></div>
+        <form id="tone-form">
+          <label>Scope <select id="tone-scope"><option value="chat">Current chat</option><option value="global">Global</option></select></label>
+          <label>Mode <select id="tone-mode"><option>preset</option><option>custom</option></select></label>
+          <label>Preset <select id="tone-preset"><option>neutral</option><option>serious</option><option>scientist</option><option>street</option><option>sarcastic_robot</option></select></label>
+          <label>Custom system prompt <textarea id="tone-custom" maxlength="8000"></textarea></label>
+          <label>Judge context messages <input id="tone-judge-n" type="number" min="5" max="30" value="20" required></label>
+          <button>Save tone</button><button id="tone-clear" type="button">Clear chat override</button>
+        </form>
+      </section>
+
+      <section id="logs">
+        <h2>Recent chat records</h2><button id="logs-refresh" type="button">Refresh logs</button><div id="log-items"></div>
+      </section>
+
+      <section id="privacy">
+        <h2>Privacy controls</h2>
+        <p id="retention"></p>
+        <label>Participant notice <textarea id="privacy-notice" readonly></textarea></label><button id="copy-notice" type="button">Copy notice</button>
+        <form id="delete-user-form"><h3>Delete observed profile</h3><label>Numeric user ID <input id="delete-user-id" required inputmode="numeric"></label><label><input id="delete-user-messages" type="checkbox"> Also purge authored messages and indexed private jobs</label><button class="danger">Delete user data</button></form>
+        <form id="purge-form"><h3>Purge all chat data</h3><p>This cancels and erases indexed jobs and clears chat history. Type <code>PURGE ALL CHAT DATA</code> to confirm.</p><label>Confirmation <input id="purge-confirmation" required autocomplete="off"></label><button class="danger">Purge chat history and jobs</button></form>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

@@ -185,6 +185,16 @@ def get_me() -> dict:
     return result
 
 
+def get_chat_member(chat_id: int, user_id: int) -> dict:
+    """Return one verified Bot API membership object."""
+    result = call("getChatMember", {"chat_id": chat_id, "user_id": user_id})
+    if not isinstance(result, dict):
+        raise TelegramAPIError(
+            "getChatMember result is not an object", method="getChatMember"
+        )
+    return result
+
+
 def split_plain_text(text: str, limit: int = MAX_TELEGRAM_CHUNK_CHARS) -> list[str]:
     """Split plain text deterministically below Telegram's message limit."""
     if limit <= 0 or limit > MAX_TELEGRAM_CHUNK_CHARS:

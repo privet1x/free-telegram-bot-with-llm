@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from app.store import history, users
+from app.store import history, lists, users
 from app.store.dedup import mark_seen
 from app.store.redis import (
     UPSTASH_REDIS_TIMEOUT,
@@ -144,6 +144,25 @@ def test_list_upsert_refreshes_expiry_and_expired_lists_are_purged():
     assert kv.lrange("hist", 0, -1) == []
 
 
+def test_privacy_tombstone_atomically_blocks_late_history_writes():
+    store = get_store()
+    store.set("privacy:job:77", "purged", ex=60)
+
+    history.upsert(
+        1,
+        {
+            "message_id": 900,
+            "source_update_id": 77,
+            "user_id": 999,
+            "is_bot": True,
+            "text": "must not survive deletion",
+            "ts": int(time.time()),
+        },
+    )
+
+    assert history.recent(1) == []
+
+
 def test_list_upsert_prunes_records_older_than_cutoff():
     kv = MemoryKV()
     kv.list_upsert_json(
@@ -189,6 +208,35 @@ def test_upstash_history_upsert_uses_one_atomic_eval():
     assert calls[0][2][3:5] == ["30", "300"]
 
 
+def test_upstash_history_tombstone_and_privacy_filter_preserve_atomicity():
+    calls = []
+
+    class FakeRedis:
+        def eval(self, script, keys, args):
+            calls.append((script, keys, args))
+            return 0
+
+    kv = UpstashKV.__new__(UpstashKV)
+    kv._r = FakeRedis()
+    kv.list_upsert_json(
+        "hist:1",
+        "message_id",
+        "9",
+        '{"message_id":9}',
+        limit=30,
+        ex=300,
+        block_key="privacy:job:77",
+    )
+    kv.list_privacy_filter("hist:1", 42, {9})
+
+    upsert, privacy = calls
+    assert upsert[1] == ["hist:1", "privacy:job:77"]
+    assert "EXISTS" in upsert[0]
+    assert "PTTL" in privacy[0]
+    assert "PEXPIRE" in privacy[0]
+    assert "TTL" not in privacy[0].replace("PTTL", "")
+
+
 def test_upstash_observe_user_uses_one_atomic_eval():
     calls = []
 
@@ -207,6 +255,46 @@ def test_upstash_observe_user_uses_one_atomic_eval():
     assert "username:" in calls[0][0]
     assert calls[0][1] == ["user:42"]
     assert calls[0][2] == ["42", value, "alice"]
+
+
+def test_upstash_expiring_set_union_is_one_atomic_eval():
+    calls = []
+
+    class FakeRedis:
+        def eval(self, script, keys, args):
+            calls.append((script, keys, args))
+            return ["9", "10"]
+
+    kv = UpstashKV.__new__(UpstashKV)
+    kv._r = FakeRedis()
+
+    assert kv.set_add_expiring("receipt", {"10", "9"}, 300) == {"9", "10"}
+    assert len(calls) == 1
+    assert "SADD" in calls[0][0]
+    assert "EXPIRE" in calls[0][0]
+    assert "SMEMBERS" in calls[0][0]
+    assert calls[0][1] == ["receipt"]
+    assert calls[0][2] == ["300", "10", "9"]
+
+
+def test_upstash_user_and_membership_deletion_is_one_atomic_eval():
+    calls = []
+
+    class FakeRedis:
+        def eval(self, script, keys, args):
+            calls.append((script, keys, args))
+            return [1, 2]
+
+    kv = UpstashKV.__new__(UpstashKV)
+    kv._r = FakeRedis()
+
+    assert kv.delete_user_data(42) == (True, 2)
+    assert len(calls) == 1
+    assert "SMEMBERS" in calls[0][0]
+    assert "SREM" in calls[0][0]
+    assert "username:" in calls[0][0]
+    assert calls[0][1] == ["user:42", "lists:index"]
+    assert calls[0][2] == ["42"]
 
 
 def test_history_prunes_each_record_by_retention(monkeypatch):
@@ -430,6 +518,83 @@ def test_observed_user_delayed_retry_cannot_roll_profile_back():
     assert result["username"] == "New_Name"
     assert users.resolve_username("new_name")["id"] == 42
     assert users.resolve_username("old_name") is None
+
+
+def test_concurrent_user_delete_and_observe_leave_no_orphaned_alias():
+    users.observe(
+        {
+            "id": 42,
+            "username": "before",
+            "name": "Before",
+            "is_bot": False,
+            "last_seen_at": 100,
+            "last_update_id": 1,
+        }
+    )
+    barrier = threading.Barrier(2)
+
+    def delete() -> None:
+        barrier.wait()
+        users.delete(42)
+
+    def observe() -> None:
+        barrier.wait()
+        users.observe(
+            {
+                "id": 42,
+                "username": "after",
+                "name": "After",
+                "is_bot": False,
+                "last_seen_at": 200,
+                "last_update_id": 2,
+            }
+        )
+
+    threads = [threading.Thread(target=delete), threading.Thread(target=observe)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    profile = users.get(42)
+    assert users.resolve_username("before") is None
+    assert (profile is None and users.resolve_username("after") is None) or (
+        profile is not None and users.resolve_username("after") == profile
+    )
+
+
+def test_concurrent_list_delete_and_member_add_cannot_leave_orphan_members():
+    lists.create(
+        {
+            "slug": "race",
+            "title": "Race",
+            "enabled": True,
+            "priority": 1,
+            "applies_to": ["explicit"],
+            "injected_prompt": "Policy",
+        }
+    )
+    barrier = threading.Barrier(2)
+
+    def delete() -> None:
+        barrier.wait()
+        lists.delete("race")
+
+    def add() -> None:
+        barrier.wait()
+        try:
+            lists.add_member("race", 42)
+        except KeyError:
+            pass
+
+    threads = [threading.Thread(target=delete), threading.Thread(target=add)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert lists.get("race") is None
+    assert get_store().smembers("list:race:members") == set()
 
 
 def test_transferred_username_is_not_stolen_by_a_stale_retry():

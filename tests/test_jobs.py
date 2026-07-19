@@ -9,6 +9,7 @@ import pytest
 
 from app.settings import Settings
 from app.store import jobs as jobs_module
+from app.store import job_backend as backend_module
 from app.store.job_backend import MAX_PROCESS_ATTEMPTS, MemoryJobBackend
 from app.store.jobs import (
     FAILURE_NOTICE_HASH,
@@ -1144,3 +1145,74 @@ def test_concurrent_index_updates_do_not_lose_members() -> None:
     assert repository.index_job_ids(chat_index_key(-100), now=NOW) == expected
     assert repository.index_job_ids(user_index_key(8), now=NOW) == expected
     assert repository.index_job_ids(user_index_key(7), now=NOW) == expected
+
+
+def test_privacy_purge_returns_checkpoint_snapshot_and_cancels_job_atomically() -> None:
+    repository = _repository()
+    _create(repository, 400, now=NOW)
+    lease = _acquire(repository, 400, now=NOW)
+    repository.prepare_intent(
+        lease,
+        name="placeholder",
+        kind="sendMessage",
+        chunk_index=-1,
+        payload_hash="a" * 64,
+        ambiguous_on_takeover=True,
+        now=NOW,
+    )
+    repository.checkpoint(
+        lease,
+        name="placeholder",
+        result={"message_id": 9_001},
+        now=NOW,
+    )
+
+    result = repository.purge_index(user_index_key(7), now=NOW)
+
+    assert result.job_count == 1
+    assert result.outbound_message_ids == {9_001}
+    assert repository.get(400, now=NOW) is None
+    assert repository.guard(lease, now=NOW) is False
+    assert repository.index_job_ids(chat_index_key(-100), now=NOW) == []
+
+
+def test_privacy_receipt_failure_cannot_delete_job_or_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = _repository()
+    _create(repository, 401, now=NOW)
+    lease = _acquire(repository, 401, now=NOW)
+    repository.prepare_intent(
+        lease,
+        name="placeholder",
+        kind="sendMessage",
+        chunk_index=-1,
+        payload_hash="b" * 64,
+        ambiguous_on_takeover=True,
+        now=NOW,
+    )
+    repository.checkpoint(
+        lease,
+        name="placeholder",
+        result={"message_id": 9_002},
+        now=NOW,
+    )
+
+    class FailingReceiptStore:
+        @staticmethod
+        def set_add_expiring(*_args, **_kwargs):
+            raise RuntimeError("receipt unavailable")
+
+    monkeypatch.setattr(backend_module, "get_store", lambda: FailingReceiptStore())
+    with pytest.raises(RuntimeError, match="receipt unavailable"):
+        repository.backend.purge(
+            "401",
+            index_keys=[chat_index_key(-100), user_index_key(7)],
+            receipt_key="privacy:receipt:test",
+            receipt_ttl=100,
+            now=NOW,
+        )
+
+    assert repository.get(401, now=NOW) is not None
+    assert repository.index_job_ids(chat_index_key(-100), now=NOW) == ["401"]
+    assert repository.guard(lease, now=NOW) is True
