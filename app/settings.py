@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     # MVP is intentionally limited to one closed group. None is convenient for
     # local tests, but production readiness checks reject a missing value.
     TELEGRAM_ALLOWED_CHAT_ID: int | None = None
+    # Explicit escape hatch for isolated local tests only. Vercel readiness and
+    # normal local operation continue to require the single allowed chat ID.
+    ALLOW_UNFILTERED_LOCAL_CHATS: bool = False
 
     # NVIDIA NIM (used from ticket 02 onwards)
     NVIDIA_API_KEY: str = ""
@@ -93,9 +96,13 @@ _WEBHOOK_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
 _EXPECTED_FLASH_MODEL = "deepseek-ai/deepseek-v4-flash"
 _EXPECTED_SMART_MODEL = "deepseek-ai/deepseek-v4-pro"
 _VERCEL_MAX_DURATION_SECONDS = 300
+# Three configured QStash retries use two 275-second minimum delays followed by
+# an exponential delay of roughly 1,808 seconds. One hour leaves additional
+# room for publication, the exhausted-retry callback, and provider jitter.
+_MIN_JOB_RETENTION_SECONDS = 3_600
 
 
-def _is_https_base_url(value: str) -> bool:
+def is_https_base_url(value: str) -> bool:
     parsed = urlsplit(value)
     return bool(
         parsed.scheme == "https"
@@ -142,7 +149,7 @@ def production_webhook_config_errors(config: Settings = settings) -> list[str]:
     ):
         errors.append("TELEGRAM_WEBHOOK_SECRET")
     if config.PUBLIC_BASE_URL:
-        if not _is_https_base_url(config.PUBLIC_BASE_URL):
+        if not is_https_base_url(config.PUBLIC_BASE_URL):
             errors.append("PUBLIC_BASE_URL")
     if config.UPSTASH_REDIS_REST_URL:
         parsed = urlsplit(config.UPSTASH_REDIS_REST_URL)
@@ -153,8 +160,8 @@ def production_webhook_config_errors(config: Settings = settings) -> list[str]:
     return sorted(set(errors))
 
 
-def production_config_errors(config: Settings = settings) -> list[str]:
-    """Return names of missing or unsafe production settings through Ticket 02."""
+def production_bot_config_errors(config: Settings = settings) -> list[str]:
+    """Return production errors that prevent Telegram/worker operation."""
     errors = production_webhook_config_errors(config)
     required = {
         "NVIDIA_API_KEY": config.NVIDIA_API_KEY,
@@ -163,20 +170,11 @@ def production_config_errors(config: Settings = settings) -> list[str]:
         "QSTASH_NEXT_SIGNING_KEY": config.QSTASH_NEXT_SIGNING_KEY,
     }
     errors.extend(name for name, value in required.items() if not value)
-    if not isinstance(config.SUPER_ADMIN_ID, int) or isinstance(config.SUPER_ADMIN_ID, bool) or config.SUPER_ADMIN_ID <= 0:
-        errors.append("SUPER_ADMIN_ID")
-    if not session_secret_is_safe(config.SESSION_SECRET):
-        errors.append("SESSION_SECRET")
-    if not config.TELEGRAM_OIDC_CLIENT_ID:
-        errors.append("TELEGRAM_OIDC_CLIENT_ID")
-    if not config.TELEGRAM_OIDC_CLIENT_SECRET:
-        errors.append("TELEGRAM_OIDC_CLIENT_SECRET")
-
     if config.LLM_MODEL_FAST != _EXPECTED_FLASH_MODEL:
         errors.append("LLM_MODEL_FAST")
     if config.LLM_MODEL_SMART != _EXPECTED_SMART_MODEL:
         errors.append("LLM_MODEL_SMART")
-    if config.QSTASH_URL and not _is_https_base_url(config.QSTASH_URL):
+    if config.QSTASH_URL and not is_https_base_url(config.QSTASH_URL):
         errors.append("QSTASH_URL")
 
     integer_values = {
@@ -202,4 +200,49 @@ def production_config_errors(config: Settings = settings) -> list[str]:
     ):
         errors.extend(["WORKER_BUDGET_SECONDS", "JOB_LEASE_SECONDS"])
 
+    retention = config.JOB_RETENTION_SECONDS
+    cooldown = config.AUTO_TRIGGER_COOLDOWN_SECONDS
+    if (
+        isinstance(retention, bool)
+        or not isinstance(retention, int)
+        or retention < _MIN_JOB_RETENTION_SECONDS
+    ):
+        errors.append("JOB_RETENTION_SECONDS")
+    if (
+        isinstance(cooldown, bool)
+        or not isinstance(cooldown, int)
+        or not isinstance(retention, int)
+        or isinstance(retention, bool)
+        or cooldown > retention
+    ):
+        errors.append("AUTO_TRIGGER_COOLDOWN_SECONDS")
+
     return sorted(set(errors))
+
+
+def production_admin_config_errors(config: Settings = settings) -> list[str]:
+    """Return production errors that prevent authenticated admin operation."""
+    errors: list[str] = []
+    if (
+        not isinstance(config.SUPER_ADMIN_ID, int)
+        or isinstance(config.SUPER_ADMIN_ID, bool)
+        or config.SUPER_ADMIN_ID <= 0
+    ):
+        errors.append("SUPER_ADMIN_ID")
+    if not session_secret_is_safe(config.SESSION_SECRET):
+        errors.append("SESSION_SECRET")
+    if not config.TELEGRAM_OIDC_CLIENT_ID:
+        errors.append("TELEGRAM_OIDC_CLIENT_ID")
+    if not config.TELEGRAM_OIDC_CLIENT_SECRET:
+        errors.append("TELEGRAM_OIDC_CLIENT_SECRET")
+    return sorted(set(errors))
+
+
+def production_config_errors(config: Settings = settings) -> list[str]:
+    """Return all missing or unsafe production settings for the full app."""
+    return sorted(
+        set(
+            production_bot_config_errors(config)
+            + production_admin_config_errors(config)
+        )
+    )

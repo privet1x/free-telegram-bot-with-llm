@@ -14,6 +14,7 @@ IGNORE_SLUG = "ignore"
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _SCOPES = {"explicit", "auto", "judge"}
 _MAX_PROMPT = 8_000
+MAX_LISTS = 100
 _cap_overflow_count = 0
 
 
@@ -72,16 +73,38 @@ def get(slug: str) -> dict[str, Any] | None:
     try:
         value = json.loads(raw)
     except (TypeError, ValueError):
-        return None
-    return value if isinstance(value, dict) else None
+        raise ValueError("stored list is corrupt") from None
+    if not isinstance(value, dict):
+        raise ValueError("stored list is corrupt")
+    try:
+        item = _validate(value)
+    except (TypeError, ValueError):
+        raise ValueError("stored list is corrupt") from None
+    if item["slug"] != slug:
+        raise ValueError("stored list is corrupt")
+    return item
 
 
 def all_lists() -> list[dict[str, Any]]:
+    store = get_store()
+    slugs = sorted(store.smembers(LISTS_INDEX_KEY))
     values: list[dict[str, Any]] = []
-    for slug in sorted(get_store().smembers(LISTS_INDEX_KEY)):
-        item = get(slug)
-        if item is not None:
-            values.append(item)
+    for slug, raw in zip(slugs, store.get_many([_key(slug) for slug in slugs])):
+        if raw is None:
+            raise ValueError("stored list index is corrupt")
+        try:
+            item = json.loads(raw)
+        except (TypeError, ValueError):
+            raise ValueError("stored list is corrupt") from None
+        if not isinstance(item, dict):
+            raise ValueError("stored list is corrupt")
+        try:
+            normalized = _validate(item)
+        except (TypeError, ValueError):
+            raise ValueError("stored list is corrupt") from None
+        if normalized["slug"] != slug:
+            raise ValueError("stored list index is corrupt")
+        values.append(normalized)
     return sorted(values, key=lambda item: (-int(item["priority"]), str(item["slug"])))
 
 
@@ -95,9 +118,12 @@ def create(value: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
         item["slug"],
         json.dumps(item, ensure_ascii=False, separators=(",", ":")),
         create_only=not force,
+        max_items=MAX_LISTS,
     )
     if status == "exists":
         raise ValueError("list already exists")
+    if status == "limit":
+        raise ValueError(f"at most {MAX_LISTS} lists are allowed")
     return item
 
 
@@ -185,12 +211,19 @@ def remove_user_from_all(user_id: int) -> int:
 def member_lists(user_id: int, kind: str) -> list[dict[str, Any]]:
     if kind not in _SCOPES:
         raise ValueError("invalid list scope")
-    result = [
-        item for item in all_lists()
+    candidates = [
+        item
+        for item in all_lists()
         if item.get("slug") != IGNORE_SLUG
         and item.get("enabled")
         and kind in item.get("applies_to", [])
-        and is_member(item["slug"], user_id)
+    ]
+    memberships = get_store().set_memberships(
+        [f"list:{item['slug']}:members" for item in candidates], _user(user_id)
+    )
+    result = [
+        item for item, is_current_member in zip(candidates, memberships)
+        if is_current_member
     ]
     global _cap_overflow_count
     if len(result) > settings.MAX_LIST_POLICIES:

@@ -18,7 +18,7 @@ from app.auth.telegram_oidc import consume_state, create_state
 from app.auth.membership import require_group_member
 from app.settings import settings
 from app.search.tavily import sanitize_query
-from app.store import history, lists, users
+from app.store import config_store, history, lists, users
 from app.store import admins
 from app.store.redis import get_store
 from app.store.jobs import get_job_repository, user_index_key
@@ -167,6 +167,11 @@ def test_oidc_jwks_validation_uses_verified_numeric_id_and_supports_rotation(
         {"id": True},
         {"id": "101"},
         {"sub": ""},
+        {"sub": " leading-space"},
+        {"sub": "trailing-space "},
+        {"sub": "subject\nwith-control"},
+        {"sub": "subject\u202ewith-bidi-control"},
+        {"sub": "x" * 256},
     ],
 )
 def test_oidc_rejects_invalid_verified_claims(monkeypatch, overrides):
@@ -228,6 +233,19 @@ def test_public_config_is_an_exact_secret_free_shape(client, monkeypatch):
     }
 
 
+def test_production_admin_routes_fail_closed_on_unsafe_session_secret(
+    client, monkeypatch
+):
+    _configure_admin(monkeypatch)
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.setattr(settings, "SESSION_SECRET", "too-short")
+
+    with pytest.raises(PermissionError):
+        session.issue_session(101)
+    assert client.get("/api/auth/telegram/start").status_code == 503
+    assert client.get("/api/admin/me").status_code == 503
+
+
 def test_mutations_require_same_origin_and_csrf(client, monkeypatch):
     _configure_admin(monkeypatch)
     headers = _admin_headers(101)
@@ -237,6 +255,21 @@ def test_mutations_require_same_origin_and_csrf(client, monkeypatch):
 
     bad_csrf = dict(headers, **{"X-CSRF-Token": "wrong"})
     assert client.delete("/api/admin/rules/example", headers=bad_csrf).status_code == 403
+
+    strict_referer = dict(headers)
+    strict_referer.pop("Origin")
+    strict_referer["Referer"] = f"{settings.PUBLIC_BASE_URL}/rules"
+    assert (
+        client.delete("/api/admin/rules/example", headers=strict_referer).status_code
+        == 200
+    )
+
+    attacker_referer = dict(strict_referer)
+    attacker_referer["Referer"] = "https://admin.example.evil/rules"
+    assert (
+        client.delete("/api/admin/rules/example", headers=attacker_referer).status_code
+        == 403
+    )
 
 
 def test_admin_assignment_requires_current_group_member(client, monkeypatch):
@@ -274,6 +307,73 @@ def test_admin_json_models_reject_unknown_fields(client, monkeypatch):
         },
         headers=_admin_headers(101),
     )
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/api/admin/admins", {"user_id": True}),
+        (
+            "/api/admin/lists",
+            {
+                "slug": 1,
+                "title": "List",
+                "enabled": True,
+                "priority": 1,
+                "applies_to": ["auto"],
+                "injected_prompt": "Policy.",
+            },
+        ),
+        (
+            "/api/admin/lists",
+            {
+                "slug": "list",
+                "title": "List",
+                "enabled": "false",
+                "priority": 1,
+                "applies_to": ["auto"],
+                "injected_prompt": "Policy.",
+            },
+        ),
+        (
+            "/api/admin/rules",
+            {
+                "id": "rule",
+                "enabled": True,
+                "priority": 1,
+                "scope": "all",
+                "match": {"type": "word", "value": "hello"},
+                "instruction": "Reply.",
+                "stop_processing": "false",
+            },
+        ),
+    ],
+)
+def test_admin_models_reject_coercive_json_types(client, monkeypatch, path, payload):
+    _configure_admin(monkeypatch)
+    monkeypatch.setattr(
+        "app.admin.routes.require_group_member",
+        lambda *_args, **_kwargs: pytest.fail("invalid input reached membership"),
+    )
+
+    response = client.post(path, json=payload, headers=_admin_headers(101))
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/admin/rules/INVALID!",
+        "/api/admin/lists/INVALID!/members/5",
+    ],
+)
+def test_invalid_admin_path_identifiers_return_4xx(client, monkeypatch, path):
+    _configure_admin(monkeypatch)
+
+    response = client.delete(path, headers=_admin_headers(101))
+
     assert response.status_code == 422
 
 
@@ -766,6 +866,31 @@ def test_tone_api_writes_all_requested_chat_fields(client, monkeypatch):
     assert response.status_code == 200
     assert response.json()["effective"]["judge_default_n"] == 27
     assert response.json()["chat_override"]["custom_system_prompt"] == "Use this trusted prompt."
+
+
+def test_tone_api_partial_update_preserves_other_fields(client, monkeypatch):
+    _configure_admin(monkeypatch)
+    config_store.set_tone(
+        "chat",
+        chat_id=-100123,
+        tone_mode="custom",
+        tone_preset="serious",
+        custom_system_prompt="Saved chat prompt.",
+        judge_default_n=20,
+    )
+
+    response = client.put(
+        "/api/admin/tone",
+        json={"scope": "chat", "judge_default_n": 29},
+        headers=_admin_headers(101),
+    )
+
+    assert response.status_code == 200
+    override = response.json()["chat_override"]
+    assert override["tone_mode"] == "custom"
+    assert override["tone_preset"] == "serious"
+    assert override["custom_system_prompt"] == "Saved chat prompt."
+    assert override["judge_default_n"] == 29
 
 
 def test_unknown_username_explains_observation_boundary(client, monkeypatch):

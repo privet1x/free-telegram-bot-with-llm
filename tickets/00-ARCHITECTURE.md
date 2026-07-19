@@ -38,7 +38,7 @@ Critical invariants:
 5. Raw chat, names, and user instructions never enter a system role. They are
    untrusted user/data content.
 6. Send all LLM output as plain text and split it into chunks no longer than
-   4,000 Unicode characters, leaving room below Telegram's 4,096 limit.
+   4,000 UTF-16 code units, leaving room below Telegram's 4,096-unit limit.
 
 ~~~json
 {

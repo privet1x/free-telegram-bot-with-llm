@@ -13,7 +13,6 @@ where the reply is returned via the webhook body).
 from __future__ import annotations
 
 import threading
-import time
 from typing import Any, Optional
 
 import httpx
@@ -196,12 +195,25 @@ def get_chat_member(chat_id: int, user_id: int) -> dict:
 
 
 def split_plain_text(text: str, limit: int = MAX_TELEGRAM_CHUNK_CHARS) -> list[str]:
-    """Split plain text deterministically below Telegram's message limit."""
+    """Split plain text by Telegram's UTF-16 code-unit accounting."""
     if limit <= 0 or limit > MAX_TELEGRAM_CHUNK_CHARS:
         raise ValueError("limit must be between 1 and 4000")
     if not text:
         return []
-    return [text[start : start + limit] for start in range(0, len(text), limit)]
+    chunks: list[str] = []
+    start = 0
+    units = 0
+    for index, character in enumerate(text):
+        character_units = 2 if ord(character) > 0xFFFF else 1
+        if character_units > limit:
+            raise ValueError("limit cannot contain a supplementary character")
+        if units + character_units > limit:
+            chunks.append(text[start:index])
+            start = index
+            units = 0
+        units += character_units
+    chunks.append(text[start:])
+    return chunks
 
 
 def outbound_history_record(
@@ -276,11 +288,6 @@ def outbound_history_record(
         and not isinstance(raw_edit_timestamp, bool)
         else edit_timestamp
     )
-    if edited and normalized_edit_timestamp is None:
-        # Telegram returns edit_date on normal success. This fallback is needed
-        # only after a prior successful edit is recovered via "not modified".
-        normalized_edit_timestamp = int(time.time())
-
     return {
         "message_id": message_id,
         "source_update_id": source_update_id,
@@ -292,6 +299,7 @@ def outbound_history_record(
         "edit_ts": normalized_edit_timestamp if edited else None,
         "is_edited": edited,
         "is_bot": True,
+        "is_service": False,
         "reply_to": reply_to,
     }
 

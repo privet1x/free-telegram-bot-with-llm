@@ -15,6 +15,8 @@ _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _MATCH_TYPES = {"substring", "word", "phrase"}
 _SCOPES = {"auto", "explicit", "judge", "all"}
 _MAX_INSTRUCTION = 8_000
+_MAX_MATCH_VALUE = 512
+MAX_RULES = 100
 _cap_overflow_count = 0
 
 
@@ -41,7 +43,11 @@ def _validate(value: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(match, dict) or match.get("type") not in _MATCH_TYPES:
         raise ValueError("match.type is invalid")
     match_value = match.get("value")
-    if not isinstance(match_value, str) or not normalize_text(match_value):
+    if (
+        not isinstance(match_value, str)
+        or len(match_value) > _MAX_MATCH_VALUE
+        or not normalize_text(match_value)
+    ):
         raise ValueError("match.value is invalid")
     if match.get("type") == "word" and len(normalize_text(match_value).split()) != 1:
         raise ValueError("word match requires exactly one token")
@@ -75,16 +81,40 @@ def get(rule_id: str) -> dict[str, Any] | None:
     try:
         value = json.loads(raw)
     except (TypeError, ValueError):
-        return None
-    return value if isinstance(value, dict) else None
+        raise ValueError("stored rule is corrupt") from None
+    if not isinstance(value, dict):
+        raise ValueError("stored rule is corrupt")
+    try:
+        item = _validate(value)
+    except (TypeError, ValueError):
+        raise ValueError("stored rule is corrupt") from None
+    if item["id"] != rule_id:
+        raise ValueError("stored rule is corrupt")
+    return item
 
 
 def all_rules() -> list[dict[str, Any]]:
+    store = get_store()
+    rule_ids = sorted(store.smembers(RULES_INDEX_KEY))
     result: list[dict[str, Any]] = []
-    for rule_id in sorted(get_store().smembers(RULES_INDEX_KEY)):
-        item = get(rule_id)
-        if item is not None:
-            result.append(item)
+    for rule_id, raw in zip(
+        rule_ids, store.get_many([_key(rule_id) for rule_id in rule_ids])
+    ):
+        if raw is None:
+            raise ValueError("stored rule index is corrupt")
+        try:
+            item = json.loads(raw)
+        except (TypeError, ValueError):
+            raise ValueError("stored rule is corrupt") from None
+        if not isinstance(item, dict):
+            raise ValueError("stored rule is corrupt")
+        try:
+            normalized = _validate(item)
+        except (TypeError, ValueError):
+            raise ValueError("stored rule is corrupt") from None
+        if normalized["id"] != rule_id:
+            raise ValueError("stored rule index is corrupt")
+        result.append(normalized)
     return sorted(
         result,
         key=lambda item: (-int(item.get("priority", 0)), str(item.get("id", ""))),
@@ -99,9 +129,12 @@ def create(value: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
         item["id"],
         json.dumps(item, ensure_ascii=False, separators=(",", ":")),
         create_only=not force,
+        max_items=MAX_RULES,
     )
     if status == "exists":
         raise ValueError("rule already exists")
+    if status == "limit":
+        raise ValueError(f"at most {MAX_RULES} rules are allowed")
     return item
 
 

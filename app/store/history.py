@@ -46,11 +46,6 @@ def upsert(chat_id: int, record: dict) -> None:
     )
 
 
-def append(chat_id: int, record: dict) -> None:
-    """Backward-compatible alias; all writes now have upsert semantics."""
-    upsert(chat_id, record)
-
-
 def recent(chat_id: int, n: int = HISTORY_LIMIT) -> list[dict]:
     """Return the last n messages, newest first."""
     if n <= 0:

@@ -194,21 +194,21 @@ fact-check acceptance is not complete.
 
 ## Automated checks
 
-- [ ] Admin/non-admin route tests for /judge, /dispute, /deep, foreign suffix,
+- [x] Admin/non-admin route tests for /judge, /dispute, /deep, foreign suffix,
   phrase precedence, no Flash fall-through for rejected judge intent, and one
   job per update.
-- [ ] N default/clamp, snapshot cutoff before command, later-message exclusion,
+- [x] N default/clamp, snapshot cutoff before command, later-message exclusion,
   and insufficient-context branch with no LLM.
-- [ ] Deterministic/capped judge lists and judge/all rules in snapshot. Final
+- [x] Deterministic/capped judge lists and judge/all rules in snapshot. Final
   impartiality policy cannot be weakened by list/rule text.
-- [ ] Pro request shape, no reasoning output exposure, and deep_reply flow.
-- [ ] Claim schema maximum, private/non-verifiable rejection, identifier scrub,
+- [x] Pro request shape, no reasoning output exposure, and deep_reply flow.
+- [x] Claim schema maximum, private/non-verifiable rejection, identifier scrub,
   and no raw quote in Tavily query.
-- [ ] Tavily request limits; success, empty, 401, 429, timeout, and malformed
+- [x] Tavily request limits; success, empty, 401, 429, timeout, and malformed
   response. Evidence checkpoint prevents repeated search.
-- [ ] Citation allowlist, malicious snippet treated as data, and explicit
+- [x] Citation allowlist, malicious snippet treated as data, and explicit
   degraded-verdict disclosure.
-- [ ] Long verdict splitting/outbound history and all Ticket 01–03 tests/Ruff/CI.
+- [x] Long verdict splitting/outbound history and all Ticket 01–03 tests/Ruff/CI.
 
 ## Live E2E acceptance
 

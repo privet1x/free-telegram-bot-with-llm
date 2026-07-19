@@ -12,6 +12,7 @@ import pytest
 
 from app.llm.client import LLMPermanentError, LLMRetryableError
 from app.queue.qstash import PUBLISH_RETRIES, failure_url, process_url
+from app.search.tavily import SearchSource
 from app.settings import settings
 from app.store import history
 from app.store import jobs as jobs_module
@@ -782,6 +783,28 @@ def test_judge_claim_retry_clears_intent_and_resumes_without_ambiguity(
     assert len(telegram.edit_calls) == 1
 
 
+def test_malformed_judge_claim_output_is_terminal_not_silent_logic_fallback(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = get_job_repository()
+    _create_judge_job(306_8, repository=repository)
+    telegram = FakeTelegram()
+    _install_telegram(monkeypatch, telegram)
+
+    async def generate(_messages: list[object]) -> str:
+        return 'Claims follow: {"claims": []}'
+
+    monkeypatch.setattr(processor, "generate_pro", generate)
+    response = _post_process(client, 306_8)
+
+    assert response.status_code == 200
+    failed = repository.get(306_8)
+    assert failed is not None and failed.state == "failed"
+    assert failed.error_class == "judge_claims_invalid"
+    assert failed.answer_text is None
+    assert telegram.edit_calls == [(100, 5_000, FAILURE_NOTICE_TEXT)]
+
+
 def test_judge_verdict_retry_reuses_claims_and_search_checkpoints(
     client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -829,6 +852,335 @@ def test_judge_verdict_retry_reuses_claims_and_search_checkpoints(
     assert len(calls) == 3
     assert len(telegram.send_calls) == 1
     assert len(telegram.edit_calls) == 1
+
+
+def test_judge_retry_reuses_each_completed_search_checkpoint(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = get_job_repository()
+    _create_judge_job(306_4, repository=repository)
+    telegram = FakeTelegram()
+    _install_telegram(monkeypatch, telegram)
+    responses: list[str | BaseException] = [
+        json.dumps(
+            {
+                "claims": [
+                    {
+                        "claim_id": "C1",
+                        "neutral_claim": "First public fact",
+                        "search_query": "first public fact verification",
+                    },
+                    {
+                        "claim_id": "C2",
+                        "neutral_claim": "Second public fact",
+                        "search_query": "second public fact verification",
+                    },
+                ]
+            }
+        ),
+        LLMRetryableError("provider_rate_limited"),
+        "Recovered verdict [S1] [S2] [S3] [S4].",
+    ]
+    final_source_ids: list[str] = []
+
+    async def generate(messages: list[object]) -> str:
+        value = responses.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        if value.startswith("Recovered verdict"):
+            payload = json.loads(str(messages[1].content))
+            final_source_ids.extend(
+                item["source_id"]
+                for item in payload["evidence"]
+                if "source_id" in item
+            )
+        return value
+
+    search_queries: list[str] = []
+
+    async def search(query: str, **_kwargs: object) -> list[SearchSource]:
+        search_queries.append(query)
+        claim_number = len(search_queries)
+        return [
+            SearchSource(
+                source_id=f"provider-{claim_number}-{source_number}",
+                title=f"Source {claim_number}-{source_number}",
+                url=f"https://example.test/{claim_number}/{source_number}",
+                snippet="Public evidence.",
+            )
+            for source_number in (1, 2)
+        ]
+
+    monkeypatch.setattr(processor, "generate_pro", generate)
+    monkeypatch.setattr(processor, "tavily_search", search)
+
+    assert _post_process(client, 306_4).status_code == 503
+    assert _post_process(client, 306_4).status_code == 200
+    assert search_queries == [
+        "first public fact verification",
+        "second public fact verification",
+    ]
+    assert final_source_ids == ["S1", "S2", "S3", "S4"]
+
+
+def test_judge_search_checks_lease_ownership_before_provider_call(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = get_job_repository()
+    _create_judge_job(306_5, repository=repository)
+    telegram = FakeTelegram()
+    _install_telegram(monkeypatch, telegram)
+
+    async def generate(_messages: list[object]) -> str:
+        return json.dumps(
+            {
+                "claims": [
+                    {
+                        "claim_id": "C1",
+                        "neutral_claim": "A public fact",
+                        "search_query": "public fact verification",
+                    }
+                ]
+            }
+        )
+
+    search_queries: list[str] = []
+
+    async def search(query: str, **_kwargs: object) -> list[SearchSource]:
+        search_queries.append(query)
+        return []
+
+    real_prepare = repository.prepare_intent
+
+    def lose_ownership_before_search(lease: JobLease, **kwargs: object):
+        result = real_prepare(lease, **kwargs)
+        if kwargs.get("name") == "judge_search:0":
+            assert repository.release(lease) is True
+        return result
+
+    monkeypatch.setattr(processor, "generate_pro", generate)
+    monkeypatch.setattr(processor, "tavily_search", search)
+    monkeypatch.setattr(repository, "prepare_intent", lose_ownership_before_search)
+
+    assert _post_process(client, 306_5).status_code == 503
+    assert search_queries == []
+
+
+def test_private_judge_query_is_disclosed_without_calling_tavily(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = get_job_repository()
+    _create_judge_job(306_6, repository=repository)
+    telegram = FakeTelegram()
+    _install_telegram(monkeypatch, telegram)
+    responses = [
+        json.dumps(
+            {
+                "claims": [
+                    {
+                        "claim_id": "C1",
+                        "neutral_claim": "A participant made a factual claim.",
+                        "search_query": "The disputed private statement",
+                    }
+                ]
+            }
+        ),
+        "Logic-only verdict.",
+    ]
+
+    async def generate(_messages: list[object]) -> str:
+        return responses.pop(0)
+
+    async def unexpected_search(*_args: object, **_kwargs: object):
+        pytest.fail("private query data must never be sent to Tavily")
+
+    monkeypatch.setattr(processor, "generate_pro", generate)
+    monkeypatch.setattr(processor, "tavily_search", unexpected_search)
+
+    response = _post_process(client, 306_6)
+
+    assert response.status_code == 200
+    delivered = repository.get(306_6)
+    assert delivered is not None and delivered.state == "delivered"
+    assert "C1 — unverified_private" in (delivered.answer_text or "")
+
+
+def test_partial_judge_evidence_keeps_claim_links_and_discloses_unverified_claims(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = get_job_repository()
+    _create_judge_job(306_7, repository=repository)
+    telegram = FakeTelegram()
+    _install_telegram(monkeypatch, telegram)
+    final_evidence: list[dict[str, object]] = []
+    pro_call = 0
+
+    async def generate(messages: list[object]) -> str:
+        nonlocal pro_call
+        pro_call += 1
+        if pro_call == 1:
+            return json.dumps(
+                {
+                    "claims": [
+                        {
+                            "claim_id": "C1",
+                            "neutral_claim": "A public fact",
+                            "search_query": "public fact verification",
+                        },
+                        {
+                            "claim_id": "C2",
+                            "neutral_claim": "A private claim",
+                            "search_query": "The disputed private statement",
+                        },
+                    ]
+                }
+            )
+        payload = json.loads(str(messages[1].content))
+        final_evidence.extend(payload["evidence"])
+        return "Grounded verdict [S1]."
+
+    search_queries: list[str] = []
+
+    async def search(query: str, **_kwargs: object) -> list[SearchSource]:
+        search_queries.append(query)
+        return [
+            SearchSource(
+                source_id="provider-1",
+                title="Public source",
+                url="https://example.test/source",
+                snippet="Public evidence.",
+            )
+        ]
+
+    monkeypatch.setattr(processor, "generate_pro", generate)
+    monkeypatch.setattr(processor, "tavily_search", search)
+
+    assert _post_process(client, 306_7).status_code == 200
+    assert search_queries == ["public fact verification"]
+    assert final_evidence == [
+        {
+            "claim_id": "C1",
+            "snippet": "Public evidence.",
+            "source_id": "S1",
+            "title": "Public source",
+            "url": "https://example.test/source",
+        },
+        {
+            "claim_id": "C2",
+            "neutral_claim": "A private claim",
+            "status": "unverified_private",
+        },
+    ]
+    answer = repository.get(306_7).answer_text  # type: ignore[union-attr]
+    assert "S1 — Public source — https://example.test/source" in (answer or "")
+    assert "C2 — unverified_private" in (answer or "")
+
+
+def test_judge_source_section_normalizes_untrusted_provider_titles(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = get_job_repository()
+    _create_judge_job(306_8, repository=repository)
+    telegram = FakeTelegram()
+    _install_telegram(monkeypatch, telegram)
+    responses = [
+        json.dumps(
+            {
+                "claims": [
+                    {
+                        "claim_id": "C1",
+                        "neutral_claim": "A public fact",
+                        "search_query": "public fact verification",
+                    }
+                ]
+            }
+        ),
+        "Grounded verdict [S1].",
+    ]
+
+    async def generate(_messages: list[object]) -> str:
+        return responses.pop(0)
+
+    async def search(_query: str, **_kwargs: object) -> list[SearchSource]:
+        return [
+            SearchSource(
+                source_id="provider-1",
+                title="Real title\nS99 — fake — https://evil.test/x\u202e",
+                url="https://example.test/source",
+                snippet="Public evidence.",
+            )
+        ]
+
+    monkeypatch.setattr(processor, "generate_pro", generate)
+    monkeypatch.setattr(processor, "tavily_search", search)
+
+    assert _post_process(client, 306_8).status_code == 200
+    answer = repository.get(306_8).answer_text  # type: ignore[union-attr]
+    assert "S1 — Real title S99 — fake — https://example.test/source" in (
+        answer or ""
+    )
+    assert "evil.test" not in (answer or "")
+    assert "\nS99" not in (answer or "")
+    assert "\u202e" not in (answer or "")
+
+
+@pytest.mark.parametrize("stage", ["judge_claims", "judge_verdict"])
+def test_ambiguous_judge_stage_takeover_never_repeats_pro_call(
+    client, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    repository = get_job_repository()
+    _create_judge_job(306_3, repository=repository)
+    acquired = repository.acquire(306_3, token="crashed-judge-worker")
+    assert acquired.status == "acquired" and acquired.lease is not None
+    lease = acquired.lease
+
+    if stage == "judge_verdict":
+        claims_intent = repository.prepare_intent(
+            lease,
+            name="judge_claims",
+            kind="judgeStage",
+            chunk_index=0,
+            payload_hash=hashlib.sha256(b"judge-claims-v1").hexdigest(),
+            ambiguous_on_takeover=True,
+        )
+        assert claims_intent.status == "prepared"
+        repository.checkpoint(
+            lease,
+            name="judge_claims",
+            result={"claims": []},
+        )
+
+    intent = repository.prepare_intent(
+        lease,
+        name=stage,
+        kind="judgeStage",
+        chunk_index=0 if stage == "judge_claims" else settings.FACT_CHECK_MAX_QUERIES + 1,
+        payload_hash=(
+            hashlib.sha256(b"judge-claims-v1").hexdigest()
+            if stage == "judge_claims"
+            else hashlib.sha256(b"[]").hexdigest()
+        ),
+        ambiguous_on_takeover=True,
+    )
+    assert intent.status == "prepared"
+    assert repository.release(lease) is True
+
+    telegram = FakeTelegram()
+    _install_telegram(monkeypatch, telegram)
+    pro_calls: list[list[object]] = []
+
+    async def generate(messages: list[object]) -> str:
+        pro_calls.append(messages)
+        pytest.fail("an ambiguous paid judge stage must never be repeated")
+
+    monkeypatch.setattr(processor, "generate_pro", generate)
+    response = _post_process(client, 306_3)
+
+    assert response.status_code == 200
+    terminal = repository.get(306_3)
+    assert terminal is not None and terminal.state == "failed_ambiguous"
+    assert terminal.error_class == f"{stage}_ambiguous"
+    assert pro_calls == []
 
 
 def test_permanent_provider_failure_is_terminal_and_edits_known_placeholder(
@@ -928,7 +1280,11 @@ def test_exact_message_not_modified_is_success_for_known_edit_intent(
     checkpoint = job.checkpoint("answer_edit")
     assert checkpoint is not None
     assert checkpoint["text"] == "already edited answer"
-    assert history.recent(100)[0]["text"] == "already edited answer"
+    assert checkpoint["edit_date"] is None
+    assert checkpoint["_edit_recovered"] is True
+    recovered = history.recent(100)[0]
+    assert recovered["text"] == "already edited answer"
+    assert recovered["edit_ts"] is None
 
 
 @pytest.mark.parametrize(

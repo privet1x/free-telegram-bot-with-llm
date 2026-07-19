@@ -101,7 +101,41 @@ def test_ping_with_botname(client):
 
 def test_ping_addressed_to_another_bot_is_not_answered(client):
     r = post_webhook(client, make_update(update_id=13, text="/ping@OtherBot"))
-    assert r.json() == {"ok": True}
+    assert r.json() == {"ok": True, "ignored": True}
+
+
+def test_captionless_media_updates_user_and_dedup_without_using_history(client):
+    update = make_update(update_id=14, message_id=14, text="placeholder")
+    update["message"].pop("text")
+    update["message"]["photo"] = [{"file_id": "photo-1"}]
+
+    first = post_webhook(client, update)
+    duplicate = post_webhook(client, update)
+
+    assert first.json() == {"ok": True}
+    assert duplicate.json() == {"ok": True, "dedup": True}
+    assert history.recent(100) == []
+    assert users.get(5)["last_update_id"] == 14
+
+
+def test_edit_that_removes_media_caption_removes_old_history_record(client):
+    assert post_webhook(
+        client,
+        make_update(update_id=15, message_id=15, text="temporary caption"),
+    ).status_code == 200
+    edited = make_update(
+        update_id=16,
+        message_id=15,
+        text="placeholder",
+        edited=True,
+    )
+    edited["edited_message"].pop("text")
+    edited["edited_message"]["photo"] = [{"file_id": "photo-1"}]
+
+    response = post_webhook(client, edited)
+
+    assert response.status_code == 200
+    assert history.recent(100) == []
 
 
 def test_help(client):
@@ -118,6 +152,7 @@ def test_edited_service_command_only_repairs_history(client):
     assert post_webhook(client, original).json() == {"ok": True}
     assert post_webhook(client, edited).json() == {"ok": True}
     assert history.recent(100)[0]["text"] == "/ping"
+    assert history.recent(100)[0]["is_service"] is True
 
 
 # --- deduplication ---
@@ -221,6 +256,16 @@ def test_recent_n_limit(client):
     assert len(history.recent(500, n=3)) == 3
 
 
+def test_webhook_fails_closed_without_allowlist_outside_vercel(client, monkeypatch):
+    monkeypatch.setattr(settings, "TELEGRAM_ALLOWED_CHAT_ID", None)
+    monkeypatch.setattr(settings, "ALLOW_UNFILTERED_LOCAL_CHATS", False)
+
+    response = post_webhook(client, make_update(update_id=90))
+
+    assert response.status_code == 503
+    assert history.recent(100) == []
+
+
 def test_webhook_fails_closed_on_vercel_without_allowlist(client, monkeypatch):
     monkeypatch.setenv("VERCEL", "1")
     monkeypatch.setattr(settings, "TELEGRAM_ALLOWED_CHAT_ID", None)
@@ -261,3 +306,41 @@ def test_webhook_fails_closed_on_vercel_with_unsafe_public_url(client, monkeypat
     response = post_webhook(client, make_update(update_id=93))
 
     assert response.status_code == 503
+
+
+def test_production_bot_can_ingest_without_optional_admin_oidc_secrets(
+    client, monkeypatch
+):
+    # Select in-memory test adapters before installing production-looking values.
+    from app.store.jobs import get_job_repository
+
+    assert history.recent(100) == []
+    get_job_repository()
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.setattr(settings, "TELEGRAM_ALLOWED_CHAT_ID", 100)
+    monkeypatch.setattr(settings, "PUBLIC_BASE_URL", "https://bot.example")
+    monkeypatch.setattr(
+        settings, "UPSTASH_REDIS_REST_URL", "https://redis.example"
+    )
+    monkeypatch.setattr(settings, "UPSTASH_REDIS_REST_TOKEN", "redis-token")
+    monkeypatch.setattr(settings, "NVIDIA_API_KEY", "nvidia-key")
+    monkeypatch.setattr(settings, "QSTASH_TOKEN", "qstash-token")
+    monkeypatch.setattr(
+        settings, "QSTASH_CURRENT_SIGNING_KEY", "current-signing-key"
+    )
+    monkeypatch.setattr(
+        settings, "QSTASH_NEXT_SIGNING_KEY", "next-signing-key"
+    )
+    monkeypatch.setattr(settings, "SUPER_ADMIN_ID", None)
+    monkeypatch.setattr(settings, "SESSION_SECRET", "")
+    monkeypatch.setattr(settings, "TELEGRAM_OIDC_CLIENT_ID", "")
+    monkeypatch.setattr(settings, "TELEGRAM_OIDC_CLIENT_SECRET", "")
+
+    response = post_webhook(
+        client, make_update(update_id=94, message_id=94, text="ordinary message")
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert history.recent(100)[0]["text"] == "ordinary message"
+    assert client.get("/api/admin/me").status_code == 503

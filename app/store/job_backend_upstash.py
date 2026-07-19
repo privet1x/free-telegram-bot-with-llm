@@ -11,7 +11,7 @@ import json
 import threading
 from collections.abc import Mapping, Sequence
 
-from app.store.redis import UPSTASH_LOCK_TIMEOUT_SECONDS, build_upstash_redis
+from app.store.redis import build_upstash_redis
 
 
 _BASE_LUA = r"""
@@ -785,8 +785,22 @@ class UpstashJobBackend:
     """Synchronous Upstash Redis implementation of the job backend protocol."""
 
     def __init__(self, url: str, token: str) -> None:
+        self._url = url
+        self._token = token
+        self._clients = threading.local()
         self._r = build_upstash_redis(url, token)
-        self._lock = threading.RLock()
+        self._clients.redis = self._r
+
+    def _redis_client(self):
+        clients = getattr(self, "_clients", None)
+        if clients is None:
+            # Supports narrow adapter unit tests created with ``__new__``.
+            return self._r
+        client = getattr(clients, "redis", None)
+        if client is None:
+            client = build_upstash_redis(self._url, self._token)
+            clients.redis = client
+        return client
 
     def _eval(
         self,
@@ -795,12 +809,9 @@ class UpstashJobBackend:
         keys: Sequence[str],
         args: Sequence[str],
     ) -> object:
-        if not self._lock.acquire(timeout=UPSTASH_LOCK_TIMEOUT_SECONDS):
-            raise TimeoutError("Redis client contention")
-        try:
-            return self._r.eval(script, keys=list(keys), args=list(args))
-        finally:
-            self._lock.release()
+        return self._redis_client().eval(
+            script, keys=list(keys), args=list(args)
+        )
 
     def _eval_job(self, script: str, job_id: str, args: Sequence[str]) -> object:
         return self._eval(script, keys=_job_keys(job_id), args=args)

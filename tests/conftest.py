@@ -19,6 +19,7 @@ def fresh_store(monkeypatch):
     monkeypatch.setattr(settings, "TELEGRAM_BOT_TOKEN", "test-token")
     monkeypatch.setattr(settings, "TELEGRAM_BOT_USERNAME", "test_bot")
     monkeypatch.setattr(settings, "TELEGRAM_ALLOWED_CHAT_ID", None)
+    monkeypatch.setattr(settings, "ALLOW_UNFILTERED_LOCAL_CHATS", True)
     monkeypatch.setattr(settings, "NVIDIA_API_KEY", "")
     monkeypatch.setattr(settings, "QSTASH_TOKEN", "")
     monkeypatch.setattr(settings, "QSTASH_CURRENT_SIGNING_KEY", "")

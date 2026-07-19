@@ -3,7 +3,9 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from scripts import check_telegram, discover_chat_id, set_webhook as webhook_script
+from app.store import lists, rules
+from scripts import check_telegram, discover_chat_id, seed
+from scripts import set_webhook as webhook_script
 from scripts.set_webhook import MAX_CONNECTIONS, WEBHOOK_SECRET_RE, _checked
 
 
@@ -85,6 +87,70 @@ def test_set_webhook_preserves_pending_updates_unless_explicit(monkeypatch):
     assert captured[0][1]["drop_pending_updates"] is False
     assert captured[1][1]["drop_pending_updates"] is True
     assert captured[0][1]["max_connections"] == 1
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://trusted.example@evil.example",
+        "https://example.test/unexpected-path",
+        "https://example.test?redirect=evil",
+        "https://example.test#fragment",
+        "http://example.test",
+    ],
+)
+def test_set_webhook_rejects_noncanonical_origins_before_telegram_call(
+    monkeypatch, base_url
+):
+    monkeypatch.setattr(webhook_script.settings, "TELEGRAM_BOT_TOKEN", "token")
+    monkeypatch.setattr(webhook_script.settings, "TELEGRAM_WEBHOOK_SECRET", "secret")
+    monkeypatch.setattr(webhook_script.settings, "PUBLIC_BASE_URL", base_url)
+    monkeypatch.setattr(
+        webhook_script.httpx,
+        "post",
+        lambda *_args, **_kwargs: pytest.fail("invalid origin reached Telegram"),
+    )
+
+    with pytest.raises(SystemExit):
+        webhook_script.set_webhook()
+
+
+def test_seed_is_idempotent_and_preserves_admin_changes_without_force(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(seed.settings, "TELEGRAM_ALLOWED_CHAT_ID", -100)
+    monkeypatch.setattr("sys.argv", ["seed.py"])
+
+    assert seed.main() == 0
+    lists.update(
+        "aggressive",
+        {
+            "slug": "aggressive",
+            "title": "Administrator title",
+            "enabled": False,
+            "priority": 12,
+            "applies_to": ["explicit"],
+            "injected_prompt": "Administrator policy.",
+        },
+    )
+    rules.update(
+        "nonsense",
+        {
+            "id": "nonsense",
+            "enabled": False,
+            "priority": 12,
+            "scope": "explicit",
+            "match": {"type": "word", "value": "custom"},
+            "instruction": "Administrator instruction.",
+            "stop_processing": True,
+        },
+    )
+
+    assert seed.main() == 0
+    assert lists.get("aggressive")["title"] == "Administrator title"
+    assert rules.get("nonsense")["instruction"] == "Administrator instruction."
+    assert lists.get(lists.IGNORE_SLUG) is not None
+    assert "Seed completed" in capsys.readouterr().out
 
 
 def _telegram_get(actual_username, can_read_all, member_status):

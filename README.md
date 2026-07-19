@@ -93,7 +93,7 @@ Configure:
 - `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`;
 - `QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, and
   `QSTASH_NEXT_SIGNING_KEY`;
-- `NVIDIA_API_KEY`.
+- `NVIDIA_API_KEY`;
 - `TAVILY_API_KEY` for grounded judge searches;
 - `SUPER_ADMIN_ID`, the immutable positive Telegram ID of the owner;
 - `SESSION_SECRET`, at least 32 random bytes;
@@ -168,7 +168,7 @@ which must remain shorter than Vercel's 300-second function duration.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/api/health` | Health check and selected storage backend |
+| GET | `/api/health` | Health, selected storage backend, and optional dependency state |
 | POST | `/api/telegram/webhook` | Receive updates, preserve history, and enqueue exact mentions/replies |
 | POST | `/api/telegram/process` | Signed QStash worker: lease, Flash response, retry-safe Telegram delivery |
 | POST | `/api/telegram/failure` | Signed exhausted-QStash callback and checkpointed failure notice |

@@ -174,7 +174,7 @@ def parse_update(update: dict) -> Optional[IncomingMessage]:
     )
 
 
-def to_history_record(msg: IncomingMessage) -> dict:
+def to_history_record(msg: IncomingMessage, *, is_service: bool = False) -> dict:
     reply_to = None
     if msg.reply_to_message_id is not None:
         reply_to = {
@@ -194,6 +194,7 @@ def to_history_record(msg: IncomingMessage) -> dict:
         "edit_ts": msg.edit_date,
         "is_edited": msg.is_edited,
         "is_bot": msg.is_bot,
+        "is_service": bool(is_service),
         "reply_to": reply_to,
     }
 
@@ -231,3 +232,29 @@ def parse_command(text: str, bot_username: Optional[str] = None) -> Optional[str
         if not expected or target.casefold() != expected:
             return None
     return command.lower()
+
+
+def command_targets_other_bot(text: str, bot_username: Optional[str]) -> bool:
+    """Identify an explicit command suffix naming another bot."""
+    if not text or not text.startswith("/"):
+        return False
+    token = text[1:].split(maxsplit=1)[0]
+    command, separator, target = token.partition("@")
+    if not command or not separator or not target:
+        return False
+    expected = (bot_username or "").strip().lstrip("@").casefold()
+    return not expected or target.casefold() != expected
+
+
+def is_service_command(text: str, bot_username: Optional[str]) -> bool:
+    """Return whether text invokes one of this bot's non-conversation commands."""
+    return parse_command(text, bot_username) in {
+        "ping",
+        "help",
+        "tone",
+        "set_mode",
+        "mode",
+        "judge",
+        "dispute",
+        "deep",
+    }

@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import threading
 
-import pytest
-
 from app.store import job_backend_upstash as backend_module
 from app.store.job_backend_upstash import UpstashJobBackend
 
@@ -21,7 +19,6 @@ class _RecordingRedis:
 def _backend(redis: _RecordingRedis) -> UpstashJobBackend:
     backend = UpstashJobBackend.__new__(UpstashJobBackend)
     backend._r = redis
-    backend._lock = threading.RLock()
     return backend
 
 
@@ -83,15 +80,35 @@ def test_upstash_privacy_purge_returns_snapshot_and_removes_all_indexes_atomical
     assert args == ["job-1", "604800"]
 
 
-def test_upstash_client_lock_has_a_bounded_wait(monkeypatch: pytest.MonkeyPatch):
-    redis = _RecordingRedis()
-    backend = _backend(redis)
-    backend._lock = threading.Lock()
-    held = backend._lock
-    assert held.acquire() is True
-    monkeypatch.setattr(backend_module, "UPSTASH_LOCK_TIMEOUT_SECONDS", 0.001)
-    try:
-        with pytest.raises(TimeoutError, match="contention"):
+def test_upstash_job_calls_use_independent_thread_local_clients(monkeypatch):
+    barrier = threading.Barrier(2)
+    client_ids: list[int] = []
+    result_lock = threading.Lock()
+
+    class ConcurrentRedis(_RecordingRedis):
+        def eval(self, script, *, keys, args):
+            with result_lock:
+                client_ids.append(id(self))
+            barrier.wait(timeout=1)
+            return super().eval(script, keys=keys, args=args)
+
+    monkeypatch.setattr(
+        backend_module, "build_upstash_redis", lambda _url, _token: ConcurrentRedis()
+    )
+    backend = UpstashJobBackend("https://redis.example", "token")
+    errors: list[BaseException] = []
+
+    def evaluate() -> None:
+        try:
             backend._eval("return 1", keys=["job:1"], args=[])
-    finally:
-        held.release()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=evaluate) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert len(set(client_ids)) == 2

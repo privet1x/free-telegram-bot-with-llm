@@ -101,8 +101,8 @@ def _read_override(key: str) -> dict[str, Any] | None:
 def set_tone(
     scope: str,
     *,
-    tone_mode: str = "preset",
-    tone_preset: str = "neutral",
+    tone_mode: str | object = _UNSET,
+    tone_preset: str | object = _UNSET,
     custom_system_prompt: str | None | object = _UNSET,
     chat_id: int | None = None,
     judge_default_n: int | object = _UNSET,
@@ -111,29 +111,30 @@ def set_tone(
         raise ValueError("scope must be global or chat")
     if scope == "chat" and chat_id is None:
         raise ValueError("chat scope requires chat_id")
-    current = get_config(chat_id)["effective"] if scope == "chat" else (
-        _read(GLOBAL_CONFIG_KEY) or dict(DEFAULT_CONFIG)
+    configured = get_config(chat_id) if scope == "chat" else None
+    current = (
+        configured["effective"]
+        if configured is not None
+        else (_read(GLOBAL_CONFIG_KEY) or dict(DEFAULT_CONFIG))
     )
-    prompt_supplied = custom_system_prompt is not _UNSET
-    judge_supplied = judge_default_n is not _UNSET
-    if not prompt_supplied:
-        custom_system_prompt = current["custom_system_prompt"]
-    if not judge_supplied:
-        judge_default_n = current["judge_default_n"]
-    value = validate_config(
-        {
+    supplied = {
+        key: value
+        for key, value in {
             "tone_mode": tone_mode,
             "tone_preset": tone_preset,
             "custom_system_prompt": custom_system_prompt,
             "judge_default_n": judge_default_n,
-        }
-    )
+        }.items()
+        if value is not _UNSET
+    }
+    if not supplied:
+        raise ValueError("at least one tone field is required")
+    candidate = dict(current)
+    candidate.update(supplied)
+    value = validate_config(candidate)
     if scope == "chat":
-        partial = {"tone_mode": tone_mode, "tone_preset": tone_preset}
-        if prompt_supplied or tone_mode == "custom":
-            partial["custom_system_prompt"] = custom_system_prompt
-        if judge_supplied:
-            partial["judge_default_n"] = judge_default_n
+        partial = dict(configured["chat_override"] or {})
+        partial.update(supplied)
         get_store().set(config_key(chat_id), json.dumps(partial, separators=(",", ":")))
         return value
     return _write(GLOBAL_CONFIG_KEY, value)
@@ -158,88 +159,32 @@ def apply_tone_command(
     command_key = f"cmd:{update_id}"
     dedup_key = f"dedup:update:{update_id}"
     target_key = GLOBAL_CONFIG_KEY if scope == "global" else config_key(chat_id)
-    if tone_preset == "clear":
-        encoded = ""
-    else:
-        encoded = json.dumps(
+    patch_json = (
+        None
+        if tone_preset == "clear"
+        else json.dumps(
             {"tone_mode": "preset", "tone_preset": tone_preset},
             separators=(",", ":"),
         )
-    store = get_store()
-    if hasattr(store, "_values"):
-        lock = store._lock  # type: ignore[attr-defined]
-        with lock:
-            store._purge_if_expired(command_key)  # type: ignore[attr-defined]
-            store._purge_if_expired(target_key)  # type: ignore[attr-defined]
-            if store._values.get(command_key) is not None:  # type: ignore[attr-defined]
-                return False
-            if tone_preset == "clear":
-                store._values.pop(target_key, None)  # type: ignore[attr-defined]
-                store._expiry.pop(target_key, None)  # type: ignore[attr-defined]
-            elif scope == "global":
-                raw = store._values.get(target_key)  # type: ignore[attr-defined]
-                try:
-                    value = json.loads(raw) if raw else dict(DEFAULT_CONFIG)
-                except (TypeError, ValueError):
-                    raise ValueError("stored configuration is corrupt") from None
-                if not isinstance(value, dict):
-                    raise ValueError("stored configuration is corrupt")
-                value.update({"tone_mode": "preset", "tone_preset": tone_preset})
-                store._set_unlocked(  # type: ignore[attr-defined]
-                    target_key,
-                    json.dumps(validate_config(value), separators=(",", ":")),
-                    None,
-                )
-            else:
-                store._set_unlocked(target_key, encoded, None)  # type: ignore[attr-defined]
-            store._set_unlocked(command_key, "done", COMMAND_RECEIPT_SECONDS)  # type: ignore[attr-defined]
-            store._set_unlocked(dedup_key, "done", 86_400)  # type: ignore[attr-defined]
-            return True
-    script = """
-if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
-if ARGV[1] == '' then
-  redis.call('DEL', KEYS[1])
-else
-local raw = redis.call('GET', KEYS[1])
-local value
-if raw then
-  value = cjson.decode(raw)
-elseif ARGV[4] == 'global' then
-  value = {tone_mode='preset', tone_preset='neutral', custom_system_prompt=cjson.null, judge_default_n=20}
-else
-  value = {}
-end
-  local patch = cjson.decode(ARGV[1])
-  value['tone_mode'] = patch['tone_mode']
-  value['tone_preset'] = patch['tone_preset']
-  redis.call('SET', KEYS[1], cjson.encode(value))
-end
-redis.call('SET', KEYS[2], 'done', 'EX', ARGV[2])
-redis.call('SET', KEYS[3], 'done', 'EX', ARGV[3])
-return 1
-"""
-    return bool(
-        store._call(  # type: ignore[attr-defined]
-            "eval",
-            script,
-            keys=[target_key, command_key, dedup_key],
-            args=[encoded, str(COMMAND_RECEIPT_SECONDS), "86400", scope],
-        )
+    )
+    default_json = json.dumps(
+        DEFAULT_CONFIG if scope == "global" else {}, separators=(",", ":")
+    )
+    return get_store().apply_json_patch_with_receipts(
+        target_key,
+        command_key,
+        dedup_key,
+        patch_json,
+        default_json,
+        COMMAND_RECEIPT_SECONDS,
+        86_400,
     )
 
 
 def record_command(update_id: int) -> bool:
     """Atomically record a read-only command receipt and final dedup marker."""
-    store = get_store()
     command_key = f"cmd:{update_id}"
     dedup_key = f"dedup:update:{update_id}"
-    if hasattr(store, "_values"):
-        with store._lock:  # type: ignore[attr-defined]
-            store._purge_if_expired(command_key)  # type: ignore[attr-defined]
-            if store._values.get(command_key) is not None:  # type: ignore[attr-defined]
-                return False
-            store._set_unlocked(command_key, "done", COMMAND_RECEIPT_SECONDS)  # type: ignore[attr-defined]
-            store._set_unlocked(dedup_key, "done", 86_400)  # type: ignore[attr-defined]
-            return True
-    script = "if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end; redis.call('SET', KEYS[1], 'done', 'EX', ARGV[1]); redis.call('SET', KEYS[2], 'done', 'EX', ARGV[2]); return 1"
-    return bool(store._call("eval", script, keys=[command_key, dedup_key], args=[str(COMMAND_RECEIPT_SECONDS), "86400"]))  # type: ignore[attr-defined]
+    return get_store().record_receipts_once(
+        command_key, dedup_key, COMMAND_RECEIPT_SECONDS, 86_400
+    )

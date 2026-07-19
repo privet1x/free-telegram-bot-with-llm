@@ -28,6 +28,44 @@ def test_pinned_upstash_sdk_uses_a_bounded_transport_without_network() -> None:
         client.close()
 
 
+def test_upstash_kv_calls_use_independent_thread_local_clients(monkeypatch):
+    import app.store.redis as redis_module
+
+    barrier = threading.Barrier(2)
+    client_ids: list[int] = []
+    result_lock = threading.Lock()
+
+    class ConcurrentRedis:
+        def ping(self):
+            with result_lock:
+                client_ids.append(id(self))
+            barrier.wait(timeout=1)
+            return True
+
+    monkeypatch.setattr(
+        redis_module, "build_upstash_redis", lambda _url, _token: ConcurrentRedis()
+    )
+    kv = UpstashKV("https://redis.example", "token")
+    results: list[bool] = []
+    errors: list[BaseException] = []
+
+    def ping() -> None:
+        try:
+            results.append(kv.ping())
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=ping) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert results == [True, True]
+    assert len(set(client_ids)) == 2
+
+
 def test_set_nx_first_time_only():
     kv = MemoryKV()
     assert kv.set_nx("k", "1", ex=60) is True
@@ -206,6 +244,63 @@ def test_upstash_history_upsert_uses_one_atomic_eval():
     assert "EXPIRE" in calls[0][0]
     assert calls[0][1] == ["hist:1"]
     assert calls[0][2][3:5] == ["30", "300"]
+
+
+def test_upstash_tone_command_uses_partial_chat_patch_and_atomic_receipts():
+    calls = []
+
+    class FakeRedis:
+        def eval(self, script, keys, args):
+            calls.append((script, keys, args))
+            return 1
+
+    kv = UpstashKV.__new__(UpstashKV)
+    kv._r = FakeRedis()
+    patch = '{"tone_mode":"preset","tone_preset":"scientist"}'
+
+    assert kv.apply_json_patch_with_receipts(
+        "cfg:100",
+        "cmd:1",
+        "dedup:update:1",
+        patch,
+        "{}",
+        2_592_000,
+        86_400,
+    )
+
+    script, keys, args = calls[0]
+    assert keys == ["cfg:100", "cmd:1", "dedup:update:1"]
+    assert args == [patch, "{}", "2592000", "86400"]
+    assert "for key, item in pairs(patch)" in script
+    assert script.count("redis.call('SET'") == 3
+
+
+def test_upstash_policy_reads_use_one_batch_per_operation():
+    calls = []
+
+    class FakeRedis:
+        def mget(self, *keys):
+            calls.append(("mget", keys))
+            return [f"value:{key}" for key in keys]
+
+        def eval(self, script, keys, args):
+            calls.append(("eval", script, keys, args))
+            return [1, 0]
+
+    kv = UpstashKV.__new__(UpstashKV)
+    kv._r = FakeRedis()
+
+    assert kv.get_many(["rule:a", "rule:b"]) == [
+        "value:rule:a",
+        "value:rule:b",
+    ]
+    assert kv.set_memberships(["list:a:members", "list:b:members"], "5") == [
+        True,
+        False,
+    ]
+    assert calls[0] == ("mget", ("rule:a", "rule:b"))
+    assert calls[1][0] == "eval"
+    assert calls[1][2:] == (["list:a:members", "list:b:members"], ["5"])
 
 
 def test_upstash_history_tombstone_and_privacy_filter_preserve_atomicity():
@@ -651,3 +746,49 @@ def test_completion_marker_elects_one_concurrent_winner():
 
     assert results.count(True) == 1
     assert results.count(False) == 19
+
+
+def test_admin_role_version_matches_every_concurrent_successful_transition():
+    store = get_store()
+    barrier = threading.Barrier(40)
+    results: list[bool] = []
+    results_lock = threading.Lock()
+
+    def change(add: bool) -> None:
+        barrier.wait()
+        changed = store.admin_role_change(4242, add=add)
+        with results_lock:
+            results.append(changed)
+
+    threads = [
+        threading.Thread(target=change, args=(index % 2 == 0,))
+        for index in range(40)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    version = int(store.get("adminver:4242") or "0")
+    assert version == sum(results)
+    assert store.sismember("admins", "4242") is (version % 2 == 1)
+
+
+def test_upstash_admin_role_change_mutates_membership_and_version_in_one_eval():
+    calls = []
+
+    class FakeRedis:
+        def eval(self, script, keys, args):
+            calls.append((script, keys, args))
+            return 1
+
+    kv = UpstashKV.__new__(UpstashKV)
+    kv._r = FakeRedis()
+
+    assert kv.admin_role_change(4242, add=True) is True
+    script, keys, args = calls[0]
+    assert "SADD" in script
+    assert "changed == 1" in script
+    assert "INCR" in script
+    assert keys == ["admins", "adminver:4242"]
+    assert args == ["4242", "1"]

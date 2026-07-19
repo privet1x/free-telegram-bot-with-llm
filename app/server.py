@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.settings import production_config_errors
+from app.settings import production_config_errors, settings
 from app.store.redis import get_store
 from app.telegram.processor import router as processor_router
 from app.telegram.webhook import router as webhook_router
@@ -71,6 +71,9 @@ def create_app() -> FastAPI:
             "ok": ready,
             "service": "tg-llm-bot",
             "store": backend,
+            "dependencies": {
+                "tavily": "enabled" if bool(settings.TAVILY_API_KEY) else "disabled"
+            },
             "warning": "; ".join(warnings) or None,
         }
         return JSONResponse(content=body, status_code=200 if ready else 503)

@@ -1,7 +1,11 @@
 import pytest
 from pydantic import ValidationError
 
-from app.settings import Settings, production_config_errors
+from app.settings import (
+    Settings,
+    production_bot_config_errors,
+    production_config_errors,
+)
 
 
 def test_env_example_is_a_valid_settings_template():
@@ -61,6 +65,23 @@ def test_ticket_02_production_configuration_is_ready():
     assert production_config_errors(_ticket_02_settings()) == []
 
 
+def test_bot_readiness_is_independent_from_admin_oidc_configuration():
+    configured = _ticket_02_settings(
+        SUPER_ADMIN_ID=None,
+        SESSION_SECRET="",
+        TELEGRAM_OIDC_CLIENT_ID="",
+        TELEGRAM_OIDC_CLIENT_SECRET="",
+    )
+
+    assert production_bot_config_errors(configured) == []
+    assert {
+        "SUPER_ADMIN_ID",
+        "SESSION_SECRET",
+        "TELEGRAM_OIDC_CLIENT_ID",
+        "TELEGRAM_OIDC_CLIENT_SECRET",
+    }.issubset(production_config_errors(configured))
+
+
 @pytest.mark.parametrize(
     ("overrides", "expected"),
     [
@@ -73,6 +94,14 @@ def test_ticket_02_production_configuration_is_ready():
         ({"QSTASH_CURRENT_SIGNING_KEY": ""}, "QSTASH_CURRENT_SIGNING_KEY"),
         ({"QSTASH_NEXT_SIGNING_KEY": ""}, "QSTASH_NEXT_SIGNING_KEY"),
         ({"NVIDIA_API_KEY": ""}, "NVIDIA_API_KEY"),
+        ({"JOB_RETENTION_SECONDS": 3_599}, "JOB_RETENTION_SECONDS"),
+        (
+            {
+                "JOB_RETENTION_SECONDS": 3_600,
+                "AUTO_TRIGGER_COOLDOWN_SECONDS": 3_601,
+            },
+            "AUTO_TRIGGER_COOLDOWN_SECONDS",
+        ),
     ],
 )
 def test_ticket_02_production_configuration_rejects_unsafe_values(

@@ -8,7 +8,6 @@ import binascii
 import functools
 import hashlib
 import json
-import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -25,8 +24,12 @@ from app.llm.client import (
 )
 from app.llm.prompts import build_judge_messages, build_reply_messages
 from app.llm.prompts import build_claim_messages
-from app.search.judge import validate_claims, validate_citations
-from app.search.tavily import TavilyUnavailable, sanitize_query
+from app.search.judge import parse_claim_response, validate_citations, validate_claims
+from app.search.tavily import (
+    TavilyUnavailable,
+    sanitize_query,
+    sanitize_source_title,
+)
 from app.search.tavily import search as tavily_search
 from app.queue.qstash import (
     QStashVerificationError,
@@ -267,6 +270,7 @@ def _canonical_checkpoint(
     text: str,
     edited: bool,
     expected_message_id: int | None = None,
+    allow_missing_edit_date: bool = False,
 ) -> dict[str, object]:
     """Validate and bound a Bot API message before it becomes a checkpoint."""
     chat_id = _request_int(job, "chat_id")
@@ -288,7 +292,14 @@ def _canonical_checkpoint(
         or isinstance(sender_id, bool)
         or sender_id != identity.id
         or sender_is_bot is not True
-        or (edited and (isinstance(edit_date, bool) or not isinstance(edit_date, int)))
+        or (
+            edited
+            and not (
+                isinstance(edit_date, int)
+                and not isinstance(edit_date, bool)
+            )
+            and not (allow_missing_edit_date and edit_date is None)
+        )
     ):
         raise telegram_client.TelegramAPIError(
             "Telegram returned an invalid message result",
@@ -335,6 +346,8 @@ def _canonical_checkpoint(
     }
     if edited:
         checkpoint["edit_date"] = record["edit_ts"]
+        if allow_missing_edit_date and record["edit_ts"] is None:
+            checkpoint["_edit_recovered"] = True
     reply_to = record.get("reply_to")
     if isinstance(reply_to, dict):
         checkpoint["reply_to_message"] = {
@@ -514,14 +527,12 @@ async def _judge_answer(
         await _require_owned(repository, lease)
         try:
             raw_claims = await generate_pro(build_claim_messages(job))
-            claims = validate_claims(json.loads(raw_claims))
+            claims = parse_claim_response(raw_claims)
         except LLMRetryableError:
             await _sync(repository.clear_intent, lease, name="judge_claims")
             raise
-        except (json.JSONDecodeError, ValueError, TypeError):
-            claims = []
-        except TavilyUnavailable:
-            claims = []
+        except (ValueError, TypeError):
+            raise _PermanentWork("judge_claims_invalid") from None
         await _sync(repository.checkpoint, lease, name="judge_claims", result={"claims": claims})
 
     evidence: list[dict[str, str]] = []
@@ -610,7 +621,7 @@ async def _judge_answer(
                 {
                     "source_id": f"S{len(evidence) + 1}",
                     "claim_id": claim["claim_id"],
-                    "title": str(source["title"]),
+                    "title": sanitize_source_title(source["title"]),
                     "url": str(source["url"]),
                     "snippet": str(source["snippet"]),
                 }
@@ -674,7 +685,10 @@ def _synthetic_edit_result(
 ) -> dict[str, object]:
     result = dict(placeholder)
     result["text"] = text
-    result["edit_date"] = int(time.time())
+    if not isinstance(result.get("edit_date"), int) or isinstance(
+        result.get("edit_date"), bool
+    ):
+        result.pop("edit_date", None)
     return result
 
 
@@ -731,6 +745,7 @@ async def _edit_first_chunk(
                     text=text,
                     edited=True,
                     expected_message_id=placeholder_id,
+                    allow_missing_edit_date=True,
                 )
             elif exc.retryable or exc.outcome_unknown:
                 raise _RetryableWork("telegram_retryable") from None
@@ -751,6 +766,7 @@ async def _edit_first_chunk(
                 text=text,
                 edited=True,
                 expected_message_id=placeholder_id,
+                allow_missing_edit_date=checkpoint.get("_edit_recovered") is True,
             )
         except telegram_client.TelegramAPIError:
             raise _PermanentWork("answer_checkpoint_invalid") from None
@@ -915,6 +931,7 @@ async def _failure_notice(
                         text=notice_text,
                         edited=True,
                         expected_message_id=lease.placeholder_message_id,
+                        allow_missing_edit_date=True,
                     )
                 except telegram_client.TelegramAPIError:
                     await _sync(
@@ -949,30 +966,11 @@ async def _failure_notice(
         await _sync(repository.release_failure_notice, lease)
 
 
-async def _process_job(job_id: str) -> JSONResponse:
-    repository = get_job_repository()
-    acquisition = await _sync(repository.acquire, job_id)
-    if acquisition.status == "busy":
-        return _retry_response(acquisition.retry_after)
-    if acquisition.status == "terminal":
-        if acquisition.job is not None and acquisition.job.state == "failed":
-            completed, retry_after = await _failure_notice(repository, job_id)
-            if not completed:
-                return _retry_response(retry_after)
-        return JSONResponse({"ok": True}, status_code=200)
-    if acquisition.status in {"missing", "invalid_state"}:
-        return JSONResponse({"ok": True}, status_code=200)
-    if acquisition.status == "exhausted":
-        return _retry_response()
-    if acquisition.lease is None or acquisition.job is None:
-        return _retry_response()
-
-    lease = acquisition.lease
-    finished = asyncio.Event()
-    renew_task = asyncio.create_task(_renew_lease(repository, lease, finished))
+async def _owned_job_response(
+    repository: JobRepository, lease: JobLease, job: JobRecord
+) -> JSONResponse:
     try:
-        async with asyncio.timeout(settings.WORKER_BUDGET_SECONDS):
-            await _run_delivery(repository, lease, acquisition.job)
+        await _run_delivery(repository, lease, job)
         await _sync(repository.finish, lease, "delivered")
         return JSONResponse({"ok": True}, status_code=200)
     except _AmbiguousWork as exc:
@@ -997,14 +995,14 @@ async def _process_job(job_id: str) -> JSONResponse:
             )
         except OwnershipLost:
             return JSONResponse({"ok": True}, status_code=200)
-        completed, retry_after = await _failure_notice(repository, job_id)
+        completed, retry_after = await _failure_notice(repository, job.job_id)
         return (
             JSONResponse({"ok": True}, status_code=200)
             if completed
             else _retry_response(retry_after)
         )
     except OwnershipLost:
-        current = await _sync(repository.get, job_id)
+        current = await _sync(repository.get, job.job_id)
         return (
             JSONResponse({"ok": True}, status_code=200)
             if current is not None
@@ -1012,22 +1010,19 @@ async def _process_job(job_id: str) -> JSONResponse:
             in {"delivered", "failed", "failed_ambiguous", "cancelled"}
             else _retry_response()
         )
-    except (TimeoutError, _RetryableWork, JobStoreError) as exc:
-        error_class = (
-            exc.error_class
-            if isinstance(exc, (_RetryableWork, JobStoreError))
-            else "worker_budget_exceeded"
-        )
+    except (_RetryableWork, JobStoreError) as exc:
         try:
             await _sync(
                 repository.finish,
                 lease,
                 "failed_retryable",
-                error_class=error_class,
+                error_class=exc.error_class,
             )
         except OwnershipLost:
             pass
         return _retry_response()
+    except TimeoutError:
+        raise
     except Exception:
         # Unknown storage/client exceptions are never serialized. If ownership
         # remains, persist only a stable retryable class.
@@ -1039,6 +1034,52 @@ async def _process_job(job_id: str) -> JSONResponse:
                 error_class="worker_internal",
             )
         except Exception:
+            pass
+        return _retry_response()
+
+
+async def _process_job(job_id: str) -> JSONResponse:
+    repository = get_job_repository()
+    acquisition = await _sync(repository.acquire, job_id)
+    if acquisition.status == "busy":
+        return _retry_response(acquisition.retry_after)
+    if acquisition.status == "terminal":
+        if acquisition.job is not None and acquisition.job.state == "failed":
+            completed, retry_after = await _failure_notice(repository, job_id)
+            if not completed:
+                return _retry_response(retry_after)
+        return JSONResponse({"ok": True}, status_code=200)
+    if acquisition.status in {"missing", "invalid_state"}:
+        return JSONResponse({"ok": True}, status_code=200)
+    if acquisition.status == "exhausted":
+        return _retry_response()
+    if acquisition.lease is None or acquisition.job is None:
+        return _retry_response()
+
+    lease = acquisition.lease
+    finished = asyncio.Event()
+    renew_task = asyncio.create_task(_renew_lease(repository, lease, finished))
+    try:
+        async with asyncio.timeout(settings.WORKER_BUDGET_SECONDS):
+            return await _owned_job_response(
+                repository, lease, acquisition.job
+            )
+    except TimeoutError:
+        current = await _sync(repository.get, job_id)
+        if current is not None and current.state in {
+            "delivered",
+            "failed_ambiguous",
+            "cancelled",
+        }:
+            return JSONResponse({"ok": True}, status_code=200)
+        try:
+            await _sync(
+                repository.finish,
+                lease,
+                "failed_retryable",
+                error_class="worker_budget_exceeded",
+            )
+        except (OwnershipLost, JobStoreError):
             pass
         return _retry_response()
     finally:

@@ -29,7 +29,6 @@ UPSTASH_REDIS_TIMEOUT = httpx.Timeout(
     write=5.0,
     pool=3.0,
 )
-UPSTASH_LOCK_TIMEOUT_SECONDS = 2.0
 
 
 def build_upstash_redis(url: str, token: str):
@@ -60,6 +59,7 @@ class KV(Protocol):
 
     def ping(self) -> bool: ...
     def get(self, key: str) -> Optional[str]: ...
+    def get_many(self, keys: list[str]) -> list[Optional[str]]: ...
     def set(self, key: str, value: str, ex: Optional[int] = None) -> None: ...
     def set_nx(self, key: str, value: str, ex: Optional[int] = None) -> bool: ...
     def lpush(self, key: str, value: str) -> int: ...
@@ -85,12 +85,26 @@ class KV(Protocol):
     def sadd(self, key: str, *members: str) -> int: ...
     def sismember(self, key: str, member: str) -> bool: ...
     def smembers(self, key: str) -> set[str]: ...
+    def set_memberships(self, keys: list[str], member: str) -> list[bool]: ...
     def set_add_expiring(self, key: str, members: set[str], ex: int) -> set[str]: ...
     def srem(self, key: str, *members: str) -> int: ...
     def delete_if_value(self, key: str, expected: str) -> bool: ...
     def increment(self, key: str) -> int: ...
     def admin_role_change(self, user_id: int, *, add: bool) -> bool: ...
     def rate_limit(self, key: str, limit: int, window_seconds: int) -> bool: ...
+    def apply_json_patch_with_receipts(
+        self,
+        target_key: str,
+        command_key: str,
+        dedup_key: str,
+        patch_json: Optional[str],
+        default_json: str,
+        command_ttl: int,
+        dedup_ttl: int,
+    ) -> bool: ...
+    def record_receipts_once(
+        self, command_key: str, dedup_key: str, command_ttl: int, dedup_ttl: int
+    ) -> bool: ...
     def indexed_json_put(
         self,
         index_key: str,
@@ -99,6 +113,7 @@ class KV(Protocol):
         value: str,
         *,
         create_only: bool,
+        max_items: Optional[int] = None,
     ) -> str: ...
     def indexed_delete(self, index_key: str, item_key: str, member: str) -> bool: ...
     def rename_indexed_set(
@@ -202,6 +217,12 @@ class MemoryKV:
         with self._lock:
             self._purge_if_expired(key)
             return self._values.get(key)
+
+    def get_many(self, keys: list[str]) -> list[Optional[str]]:
+        with self._lock:
+            for key in keys:
+                self._purge_if_expired(key)
+            return [self._values.get(key) for key in keys]
 
     def set(self, key: str, value: str, ex: Optional[int] = None) -> None:
         with self._lock:
@@ -463,6 +484,12 @@ class MemoryKV:
             self._purge_if_expired(key)
             return set(self._sets.get(key, set()))
 
+    def set_memberships(self, keys: list[str], member: str) -> list[bool]:
+        with self._lock:
+            for key in keys:
+                self._purge_if_expired(key)
+            return [str(member) in self._sets.get(key, set()) for key in keys]
+
     def set_add_expiring(self, key: str, members: set[str], ex: int) -> set[str]:
         if ex <= 0:
             raise ValueError("ex must be positive")
@@ -541,6 +568,53 @@ class MemoryKV:
             self._set_unlocked(key, str(count), ttl)
             return count <= limit
 
+    def apply_json_patch_with_receipts(
+        self,
+        target_key: str,
+        command_key: str,
+        dedup_key: str,
+        patch_json: Optional[str],
+        default_json: str,
+        command_ttl: int,
+        dedup_ttl: int,
+    ) -> bool:
+        with self._lock:
+            self._purge_if_expired(command_key)
+            self._purge_if_expired(target_key)
+            if command_key in self._values:
+                return False
+            if patch_json is None:
+                self._values.pop(target_key, None)
+                self._expiry.pop(target_key, None)
+            else:
+                try:
+                    current = json.loads(self._values.get(target_key, default_json))
+                    patch = json.loads(patch_json)
+                except (TypeError, ValueError):
+                    raise ValueError("stored JSON is corrupt") from None
+                if not isinstance(current, dict) or not isinstance(patch, dict):
+                    raise ValueError("stored JSON is corrupt")
+                current.update(patch)
+                self._set_unlocked(
+                    target_key,
+                    json.dumps(current, ensure_ascii=False, separators=(",", ":")),
+                    None,
+                )
+            self._set_unlocked(command_key, "done", command_ttl)
+            self._set_unlocked(dedup_key, "done", dedup_ttl)
+            return True
+
+    def record_receipts_once(
+        self, command_key: str, dedup_key: str, command_ttl: int, dedup_ttl: int
+    ) -> bool:
+        with self._lock:
+            self._purge_if_expired(command_key)
+            if command_key in self._values:
+                return False
+            self._set_unlocked(command_key, "done", command_ttl)
+            self._set_unlocked(dedup_key, "done", dedup_ttl)
+            return True
+
     def indexed_json_put(
         self,
         index_key: str,
@@ -549,14 +623,22 @@ class MemoryKV:
         value: str,
         *,
         create_only: bool,
+        max_items: Optional[int] = None,
     ) -> str:
         with self._lock:
             self._purge_if_expired(item_key)
             exists = item_key in self._values
             if create_only and exists:
                 return "exists"
+            index = self._sets.setdefault(index_key, set())
+            if (
+                member not in index
+                and max_items is not None
+                and len(index) >= max_items
+            ):
+                return "limit"
             self._set_unlocked(item_key, value, None)
-            self._sets.setdefault(index_key, set()).add(member)
+            index.add(member)
             return "created" if not exists else "updated"
 
     def indexed_delete(self, index_key: str, item_key: str, member: str) -> bool:
@@ -763,20 +845,25 @@ class UpstashKV:
     """Production store on top of the Upstash Redis REST SDK."""
 
     def __init__(self, url: str, token: str) -> None:
+        self._url = url
+        self._token = token
+        self._clients = threading.local()
         self._r = build_upstash_redis(url, token)
-        self._lock = threading.RLock()
+        self._clients.redis = self._r
+
+    def _redis_client(self):
+        clients = getattr(self, "_clients", None)
+        if clients is None:
+            # Supports narrow adapter unit tests created with ``__new__``.
+            return self._r
+        client = getattr(clients, "redis", None)
+        if client is None:
+            client = build_upstash_redis(self._url, self._token)
+            clients.redis = client
+        return client
 
     def _call(self, method: str, *args: object, **kwargs: object) -> object:
-        lock = getattr(self, "_lock", None)
-        if lock is None:
-            lock = threading.RLock()
-            self._lock = lock
-        if not lock.acquire(timeout=UPSTASH_LOCK_TIMEOUT_SECONDS):
-            raise TimeoutError("Redis client contention")
-        try:
-            return getattr(self._r, method)(*args, **kwargs)
-        finally:
-            lock.release()
+        return getattr(self._redis_client(), method)(*args, **kwargs)
 
     def ping(self) -> bool:
         return bool(self._call("ping"))
@@ -784,6 +871,14 @@ class UpstashKV:
     def get(self, key: str) -> Optional[str]:
         value = self._call("get", key)
         return None if value is None else str(value)
+
+    def get_many(self, keys: list[str]) -> list[Optional[str]]:
+        if not keys:
+            return []
+        values = self._call("mget", *keys)
+        if not isinstance(values, (list, tuple)) or len(values) != len(keys):
+            raise RuntimeError("invalid Redis MGET response")
+        return [None if value is None else str(value) for value in values]
 
     def set(self, key: str, value: str, ex: Optional[int] = None) -> None:
         self._call("set", key, value, ex=ex)
@@ -1096,6 +1191,21 @@ class UpstashKV:
     def smembers(self, key: str) -> set[str]:
         return {str(item) for item in (self._call("smembers", key) or [])}
 
+    def set_memberships(self, keys: list[str], member: str) -> list[bool]:
+        if not keys:
+            return []
+        script = """
+        local result = {}
+        for index, key in ipairs(KEYS) do
+          result[index] = redis.call('SISMEMBER', key, ARGV[1])
+        end
+        return result
+        """
+        values = self._call("eval", script, keys=keys, args=[str(member)])
+        if not isinstance(values, (list, tuple)) or len(values) != len(keys):
+            raise RuntimeError("invalid Redis membership response")
+        return [bool(int(value)) for value in values]
+
     def set_add_expiring(self, key: str, members: set[str], ex: int) -> set[str]:
         if ex <= 0:
             raise ValueError("ex must be positive")
@@ -1160,6 +1270,63 @@ class UpstashKV:
             )
         )
 
+    def apply_json_patch_with_receipts(
+        self,
+        target_key: str,
+        command_key: str,
+        dedup_key: str,
+        patch_json: Optional[str],
+        default_json: str,
+        command_ttl: int,
+        dedup_ttl: int,
+    ) -> bool:
+        script = """
+        if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
+        if ARGV[1] == '' then
+          redis.call('DEL', KEYS[1])
+        else
+          local raw = redis.call('GET', KEYS[1]) or ARGV[2]
+          local value = cjson.decode(raw)
+          local patch = cjson.decode(ARGV[1])
+          for key, item in pairs(patch) do value[key] = item end
+          redis.call('SET', KEYS[1], cjson.encode(value))
+        end
+        redis.call('SET', KEYS[2], 'done', 'EX', ARGV[3])
+        redis.call('SET', KEYS[3], 'done', 'EX', ARGV[4])
+        return 1
+        """
+        return bool(
+            self._call(
+                "eval",
+                script,
+                keys=[target_key, command_key, dedup_key],
+                args=[
+                    patch_json or "",
+                    default_json,
+                    str(command_ttl),
+                    str(dedup_ttl),
+                ],
+            )
+        )
+
+    def record_receipts_once(
+        self, command_key: str, dedup_key: str, command_ttl: int, dedup_ttl: int
+    ) -> bool:
+        script = """
+        if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+        redis.call('SET', KEYS[1], 'done', 'EX', ARGV[1])
+        redis.call('SET', KEYS[2], 'done', 'EX', ARGV[2])
+        return 1
+        """
+        return bool(
+            self._call(
+                "eval",
+                script,
+                keys=[command_key, dedup_key],
+                args=[str(command_ttl), str(dedup_ttl)],
+            )
+        )
+
     def indexed_json_put(
         self,
         index_key: str,
@@ -1168,10 +1335,15 @@ class UpstashKV:
         value: str,
         *,
         create_only: bool,
+        max_items: Optional[int] = None,
     ) -> str:
         script = """
         local exists = redis.call('EXISTS', KEYS[2]) == 1
         if ARGV[3] == '1' and exists then return 'exists' end
+        local indexed = redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 1
+        if not indexed and tonumber(ARGV[4]) > 0 and redis.call('SCARD', KEYS[1]) >= tonumber(ARGV[4]) then
+          return 'limit'
+        end
         redis.call('SET', KEYS[2], ARGV[2])
         redis.call('SADD', KEYS[1], ARGV[1])
         return exists and 'updated' or 'created'
@@ -1181,7 +1353,12 @@ class UpstashKV:
                 "eval",
                 script,
                 keys=[index_key, item_key],
-                args=[member, value, "1" if create_only else "0"],
+                args=[
+                    member,
+                    value,
+                    "1" if create_only else "0",
+                    str(max_items or 0),
+                ],
             )
         )
 

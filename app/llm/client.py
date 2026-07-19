@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any, Final, Sequence
 
 from app.settings import Settings, settings
 
 FLASH_TEMPERATURE: Final = 0.4
 FLASH_MAX_COMPLETION_TOKENS: Final = 2_048
-LLM_TIMEOUT_SECONDS: Final = 180.0
+FLASH_TIMEOUT_SECONDS: Final = 180.0
+PRO_TIMEOUT_SECONDS: Final = 75.0
 EXPECTED_FLASH_MODEL: Final = "deepseek-ai/deepseek-v4-flash"
 EXPECTED_PRO_MODEL: Final = "deepseek-ai/deepseek-v4-pro"
 _MAX_RESPONSE_CHARS: Final = 64_000
+_THINK_BLOCK: Final = re.compile(
+    r"<think\b[^>]*>.*?</think\s*>", re.DOTALL | re.IGNORECASE
+)
+_THINK_TAG: Final = re.compile(r"</?think\b[^>]*>", re.IGNORECASE)
 
 
 class LLMRetryableError(RuntimeError):
@@ -45,7 +51,7 @@ def _create_flash_client(model: str, api_key: str) -> Any:
         api_key=api_key,
         temperature=FLASH_TEMPERATURE,
         max_completion_tokens=FLASH_MAX_COMPLETION_TOKENS,
-        timeout=LLM_TIMEOUT_SECONDS,
+        timeout=FLASH_TIMEOUT_SECONDS,
     )
     return base.with_thinking_mode(enabled=False)
 
@@ -67,7 +73,7 @@ def get_pro_client(config: Settings = settings) -> Any:
         api_key=config.NVIDIA_API_KEY,
         temperature=0.2,
         max_completion_tokens=2_048,
-        timeout=LLM_TIMEOUT_SECONDS,
+        timeout=PRO_TIMEOUT_SECONDS,
     )
     return base.with_thinking_mode(enabled=False)
 
@@ -158,7 +164,9 @@ def _response_text(result: object) -> str:
     content = getattr(result, "content", None)
     if not isinstance(content, str):
         raise LLMPermanentError("provider_invalid_response")
-    text = content.strip()
+    text = _THINK_BLOCK.sub("", content).strip()
+    if _THINK_TAG.search(text):
+        raise LLMPermanentError("provider_invalid_response")
     if not text or len(text) > _MAX_RESPONSE_CHARS:
         raise LLMPermanentError("provider_invalid_response")
     return text
@@ -173,7 +181,7 @@ async def generate_flash(
     """Generate a bounded Flash response or raise a sanitized classified error."""
     llm = client or get_flash_client(config)
     try:
-        async with asyncio.timeout(LLM_TIMEOUT_SECONDS):
+        async with asyncio.timeout(FLASH_TIMEOUT_SECONDS):
             result = await llm.ainvoke(list(messages))
     except asyncio.CancelledError:
         raise
@@ -195,7 +203,7 @@ async def generate_pro(
     """Generate a bounded non-thinking Pro response with Flash-equivalent safety."""
     llm = client or get_pro_client(config)
     try:
-        async with asyncio.timeout(LLM_TIMEOUT_SECONDS):
+        async with asyncio.timeout(PRO_TIMEOUT_SECONDS):
             result = await llm.ainvoke(list(messages))
     except asyncio.CancelledError:
         raise

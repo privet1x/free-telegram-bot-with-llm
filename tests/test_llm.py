@@ -16,6 +16,7 @@ from app.llm.client import (
     LLMRetryableError,
     generate_flash,
     get_flash_client,
+    get_pro_client,
 )
 from app.llm.prompts import build_reply_messages
 from app.settings import Settings
@@ -254,6 +255,21 @@ def test_flash_factory_uses_exact_model_limits_timeout_and_non_thinking_mode():
     assert base.model_kwargs == {}
 
 
+def test_judge_provider_timeouts_fit_worker_budget_with_terminal_reserve():
+    from app.search.tavily import SEARCH_ATTEMPT_TIMEOUT_SECONDS
+
+    client = get_pro_client(_settings())
+    base = client.bound
+    assert base.model == "deepseek-ai/deepseek-v4-pro"
+    assert base._client.timeout == llm_client.PRO_TIMEOUT_SECONDS == 75.0
+    assert base._async_client.timeout == llm_client.PRO_TIMEOUT_SECONDS
+    worst_case_provider_time = (
+        2 * llm_client.PRO_TIMEOUT_SECONDS
+        + 3 * 2 * SEARCH_ATTEMPT_TIMEOUT_SECONDS
+    )
+    assert worst_case_provider_time <= 210
+
+
 def test_flash_factory_rejects_missing_api_key_safely():
     with pytest.raises(LLMPermanentError) as raised:
         get_flash_client(_settings(NVIDIA_API_KEY=""))
@@ -342,6 +358,22 @@ def test_generate_flash_strips_valid_text_and_reuses_injected_client():
     assert _run_generation(messages, client) == "reusable answer"
     assert _run_generation(messages, client) == "reusable answer"
     assert client.calls == [messages, messages]
+
+
+def test_provider_reasoning_blocks_never_reach_the_delivered_text():
+    client = _StubClient(
+        result=SimpleNamespace(
+            content="<think>private chain of thought</think>\nFinal answer."
+        )
+    )
+    assert _run_generation([], client) == "Final answer."
+
+    malformed = _StubClient(
+        result=SimpleNamespace(content="<think>unclosed private reasoning")
+    )
+    with pytest.raises(LLMPermanentError) as raised:
+        _run_generation([], malformed)
+    assert raised.value.error_class == "provider_invalid_response"
 
 
 @pytest.mark.parametrize(
@@ -457,7 +489,7 @@ def test_generate_flash_enforces_bounded_total_timeout(
             await asyncio.sleep(0.05)
             return SimpleNamespace(content="too late")
 
-    monkeypatch.setattr(llm_client, "LLM_TIMEOUT_SECONDS", 0.001)
+    monkeypatch.setattr(llm_client, "FLASH_TIMEOUT_SECONDS", 0.001)
 
     with pytest.raises(LLMRetryableError) as raised:
         _run_generation([], SlowClient())

@@ -168,7 +168,7 @@ The future auto-route cooldown does not apply to explicit mention/reply jobs.
   every non-idempotent sendMessage, write a fenced intent with payload hash and
   chunk index. Save message IDs after success.
 - [x] Save the generated answer before any Telegram delivery. Split plain text
-  into chunks up to 4,000 Unicode characters. Edit the placeholder with the
+  into chunks up to 4,000 UTF-16 code units. Edit the placeholder with the
   first chunk, then send later chunks. Upsert successful outbound Bot API
   messages into history.
 - [x] The placeholder is the sole pre-answer delivery; save the answer before

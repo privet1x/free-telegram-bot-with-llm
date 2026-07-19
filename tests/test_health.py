@@ -6,6 +6,20 @@ def test_health_ok(client):
     assert body["service"] == "tg-llm-bot"
     # without Upstash creds, tests use the in-memory backend
     assert body["store"] == "memory"
+    assert body["dependencies"]["tavily"] == "disabled"
+
+
+def test_health_reports_tavily_enabled_without_exposing_its_key(client, monkeypatch):
+    from app.settings import settings
+
+    key = "TAVILY_SECRET_CANARY"
+    monkeypatch.setattr(settings, "TAVILY_API_KEY", key)
+
+    response = client.get("/api/health")
+
+    assert response.status_code == 200
+    assert response.json()["dependencies"]["tavily"] == "enabled"
+    assert key not in response.text
 
 
 def test_health_fails_closed_on_vercel_without_required_config(client, monkeypatch):

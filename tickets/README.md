@@ -39,7 +39,7 @@ and privacy contract are in [00-ARCHITECTURE.md](00-ARCHITECTURE.md).
 - The web admin uses Telegram OIDC Authorization Code Flow with PKCE/state, not
   the legacy Login Widget.
 - Vercel workers have `maxDuration=300`; LLM output is plain text and is split
-  into chunks no longer than 4,000 Unicode characters.
+  into chunks no longer than 4,000 UTF-16 code units.
 
 ## Completion definition
 

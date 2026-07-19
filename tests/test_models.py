@@ -124,11 +124,13 @@ def test_to_history_record_shape():
         "edit_ts",
         "is_edited",
         "is_bot",
+        "is_service",
         "reply_to",
     }
     assert rec["text"] == "rec"
     assert rec["source_update_id"] == 1
     assert rec["ts"] == 1_784_200_000
+    assert rec["is_service"] is False
     assert rec["edit_ts"] is None
     assert rec["reply_to"] is None
 
@@ -318,9 +320,25 @@ def test_edit_message_text_uses_plain_text_without_parse_mode(monkeypatch):
     ],
 )
 def test_plain_text_split_boundaries(length, sizes):
-    chunks = telegram_client.split_plain_text("🙂" * length)
+    chunks = telegram_client.split_plain_text("a" * length)
     assert [len(chunk) for chunk in chunks] == sizes
-    assert "".join(chunks) == "🙂" * length
+    assert "".join(chunks) == "a" * length
+
+
+@pytest.mark.parametrize(
+    ("text", "sizes"),
+    [
+        ("🙂" * 2_000, [2_000]),
+        ("🙂" * 2_001, [2_000, 1]),
+        ("a" * 3_999 + "🙂" + "b", [3_999, 2]),
+    ],
+)
+def test_plain_text_split_uses_telegram_utf16_units(text, sizes):
+    chunks = telegram_client.split_plain_text(text)
+
+    assert [len(chunk) for chunk in chunks] == sizes
+    assert "".join(chunks) == text
+    assert all(len(chunk.encode("utf-16-le")) // 2 <= 4_000 for chunk in chunks)
 
 
 def test_telegram_error_classification_and_exact_not_modified():
@@ -392,3 +410,14 @@ def test_outbound_history_record_normalizes_successful_bot_message():
     assert record["user_id"] == 999
     assert record["text"] == "Thinking…"
     assert record["is_bot"] is True
+
+    recovered_edit = telegram_client.outbound_history_record(
+        result,
+        source_update_id=123,
+        fallback_chat_id=100,
+        fallback_user_id=999,
+        text="already edited",
+        edited=True,
+    )
+    assert recovered_edit["is_edited"] is True
+    assert recovered_edit["edit_ts"] is None

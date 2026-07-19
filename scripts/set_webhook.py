@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import httpx  # noqa: E402
 
-from app.settings import settings  # noqa: E402
+from app.settings import is_https_base_url, settings  # noqa: E402
 
 ALLOWED_UPDATES = ["message", "edited_message"]
 MAX_CONNECTIONS = 1  # preserve chat order; this bot serves one small group
@@ -71,10 +71,11 @@ def set_webhook(*, drop_pending: bool = False) -> None:
             "only A-Z, a-z, 0-9, '_' or '-'."
         )
         raise SystemExit(1)
-    base = _require("PUBLIC_BASE_URL", settings.PUBLIC_BASE_URL).rstrip("/")
-    if not base.startswith("https://"):
-        print("ERROR: PUBLIC_BASE_URL must use HTTPS for a Telegram webhook.")
+    configured_base = _require("PUBLIC_BASE_URL", settings.PUBLIC_BASE_URL)
+    if not is_https_base_url(configured_base):
+        print("ERROR: PUBLIC_BASE_URL must be an HTTPS origin without userinfo, path, query, or fragment.")
         raise SystemExit(1)
+    base = configured_base.rstrip("/")
     url = f"{base}/api/telegram/webhook"
     resp = _request(
         "setWebhook",

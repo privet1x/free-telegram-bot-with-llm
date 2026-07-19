@@ -7,6 +7,7 @@ import hmac
 import os
 import threading
 import time
+import unicodedata
 from typing import Literal, TypeVar
 from urllib.parse import urlsplit
 
@@ -15,6 +16,7 @@ import jwt
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from starlette.concurrency import run_in_threadpool
 
 from app.auth import session
 from app.auth.membership import require_group_member
@@ -89,12 +91,22 @@ class RuleInput(StrictModel):
 
 class ToneInput(StrictModel):
     scope: Literal["global", "chat"]
-    tone_mode: Literal["preset", "custom"]
+    tone_mode: Literal["preset", "custom"] | None = None
     tone_preset: Literal[
         "neutral", "serious", "scientist", "street", "sarcastic_robot"
-    ]
+    ] | None = None
     custom_system_prompt: str | None = Field(default=None, max_length=8_000)
-    judge_default_n: int = Field(ge=5, le=30)
+    judge_default_n: int | None = Field(default=None, ge=5, le=30)
+
+    @model_validator(mode="after")
+    def contains_tone_update(self) -> "ToneInput":
+        update_fields = self.model_fields_set - {"scope"}
+        if not update_fields:
+            raise ValueError("provide at least one tone field")
+        for field in ("tone_mode", "tone_preset", "judge_default_n"):
+            if field in update_fields and getattr(self, field) is None:
+                raise ValueError(f"{field} cannot be null")
+        return self
 
 
 class PurgeInput(StrictModel):
@@ -245,7 +257,12 @@ def _decode_identity(id_token: str, nonce: str) -> int:
     if (
         not isinstance(subject, str)
         or not subject
-        or len(subject) > 256
+        or subject != subject.strip()
+        or len(subject.encode("utf-8")) > 255
+        or any(
+            unicodedata.category(character).startswith("C")
+            for character in subject
+        )
         or isinstance(user_id, bool)
         or not isinstance(user_id, int)
         or user_id <= 0
@@ -307,11 +324,10 @@ async def auth_callback(
 ):
     response: JSONResponse | RedirectResponse
     try:
-        if (
-            not _production_ready()
-            or not _auth_config_ready()
-            or not _rate_limit(request, "callback", 30)
-        ):
+        if not _production_ready() or not _auth_config_ready():
+            raise PermissionError("authentication unavailable")
+        rate_allowed = await run_in_threadpool(_rate_limit, request, "callback", 30)
+        if not rate_allowed:
             raise PermissionError("authentication unavailable")
         if not code or len(code) > 4_096 or not state:
             raise ValueError("missing callback parameters")
@@ -321,7 +337,9 @@ async def auth_callback(
         cookie = request.cookies.get(OIDC_COOKIE)
         if not cookie:
             raise ValueError("missing browser binding")
-        verifier, _, nonce = consume_state(state, cookie, redirect_uri)
+        verifier, _, nonce = await run_in_threadpool(
+            consume_state, state, cookie, redirect_uri
+        )
         async with httpx.AsyncClient(follow_redirects=False, timeout=10) as client:
             token_response = await client.post(
                 "https://oauth.telegram.org/token",
@@ -343,8 +361,8 @@ async def auth_callback(
         id_token = token_data.get("id_token") if isinstance(token_data, dict) else None
         if not isinstance(id_token, str) or len(id_token) > 32_768:
             raise ValueError("missing identity token")
-        user_id = _decode_identity(id_token, nonce)
-        token, _ = session.issue_session(user_id)
+        user_id = await run_in_threadpool(_decode_identity, id_token, nonce)
+        token, _ = await run_in_threadpool(session.issue_session, user_id)
         response = RedirectResponse("/", status_code=302)
         response.set_cookie(
             session.SESSION_COOKIE,
@@ -676,7 +694,7 @@ async def tone_put(request: Request):
     payload = await _parse_body(request, ToneInput)
     if isinstance(payload, JSONResponse):
         return payload
-    values = payload.model_dump()
+    values = payload.model_dump(exclude_unset=True)
     scope = values.pop("scope")
     try:
         config_store.set_tone(

@@ -20,7 +20,7 @@ from app.request_body import (
     RequestBodyTooLarge,
     read_bounded_body,
 )
-from app.settings import production_config_errors, settings
+from app.settings import production_bot_config_errors, settings
 from app.store import admins, history, users
 from app.store import config_store, lists, rules
 from app.store.dedup import already_seen, mark_seen
@@ -34,6 +34,8 @@ from app.telegram.client import webhook_reply
 from app.telegram.identity import BotIdentityUnavailable
 from app.telegram.models import (
     IncomingMessage,
+    command_targets_other_bot,
+    is_service_command,
     parse_command,
     parse_update,
     to_history_record,
@@ -67,9 +69,14 @@ def _secret_ok(request: Request) -> bool:
 
 
 def _production_ready() -> bool:
-    if not os.environ.get("VERCEL"):
-        return True
-    return not production_config_errors()
+    if os.environ.get("VERCEL"):
+        return not production_bot_config_errors()
+    allowed_chat_id = settings.TELEGRAM_ALLOWED_CHAT_ID
+    return bool(
+        isinstance(allowed_chat_id, int)
+        and not isinstance(allowed_chat_id, bool)
+        and allowed_chat_id != 0
+    ) or settings.ALLOW_UNFILTERED_LOCAL_CHATS
 
 
 def _safe_enqueue(job: JobRecord) -> bool:
@@ -97,9 +104,9 @@ def _tone_command_response(
     if argument == "sarcastic":
         argument = "sarcastic_robot"
     if command == "mode":
+        active = config_store.get_config(msg.chat_id)["effective"]
         if update_id is not None and not config_store.record_command(update_id):
             return {"ok": True, "dedup": True}
-        active = config_store.get_config(msg.chat_id)["effective"]
         return webhook_reply(
             msg.chat_id,
             f"Mode: {active['tone_mode']}/{active['tone_preset']}. Allowed: {', '.join(_TONE_SLUGS)}",
@@ -145,7 +152,19 @@ def _persist_incoming(msg: IncomingMessage) -> None:
     observed_user = to_observed_user(msg)
     if observed_user is not None:
         users.observe(observed_user)
-    history.upsert(msg.chat_id, to_history_record(msg))
+    if not msg.text.strip():
+        if msg.is_edited:
+            history.remove_message_ids(msg.chat_id, {msg.message_id})
+        return
+    history.upsert(
+        msg.chat_id,
+        to_history_record(
+            msg,
+            is_service=is_service_command(
+                msg.text, settings.TELEGRAM_BOT_USERNAME
+            ),
+        ),
+    )
 
 
 def _persist_job_trigger(job: JobRecord) -> None:
@@ -198,7 +217,10 @@ def _user_ids_in_record(record: object) -> set[int]:
 def _request_snapshot(
     msg: IncomingMessage, route: str, context: list[dict[str, Any]]
 ) -> dict[str, object]:
-    trigger = to_history_record(msg)
+    trigger = to_history_record(
+        msg,
+        is_service=is_service_command(msg.text, settings.TELEGRAM_BOT_USERNAME),
+    )
     return {
         "version": 1,
         "kind": route if route in {"judge", "deep_reply", "auto_rule"} else "reply",
@@ -220,10 +242,20 @@ def _request_snapshot(
     }
 
 
-def _effective_policy(msg: IncomingMessage, scope: str) -> dict[str, object]:
+def _effective_policy(
+    msg: IncomingMessage,
+    scope: str,
+    *,
+    matched_rules: list[dict[str, Any]] | None = None,
+    rule_text: str | None = None,
+) -> dict[str, object]:
     configuration = config_store.get_config(msg.chat_id)["effective"]
     matched_lists = lists.member_lists(msg.user_id or 0, scope)
-    matched_rules = rules.resolve(msg.text, scope)
+    selected_rules = (
+        rules.resolve(msg.text if rule_text is None else rule_text, scope)
+        if matched_rules is None
+        else matched_rules
+    )
     return {
         "tone_mode": configuration["tone_mode"],
         "tone_preset": configuration["tone_preset"],
@@ -235,7 +267,7 @@ def _effective_policy(msg: IncomingMessage, scope: str) -> dict[str, object]:
             "is_admin": admins.is_admin(msg.user_id),
         },
         "list_policies": matched_lists[: settings.MAX_LIST_POLICIES],
-        "rule_policies": matched_rules[: settings.MAX_RULE_POLICIES],
+        "rule_policies": selected_rules[: settings.MAX_RULE_POLICIES],
     }
 
 
@@ -257,6 +289,13 @@ def _prepare_message(msg: IncomingMessage) -> _Prepared:
 
     # Edits and built-in service commands never make an LLM job.
     command = parse_command(msg.text, settings.TELEGRAM_BOT_USERNAME)
+    if command is None and command_targets_other_bot(
+        msg.text, settings.TELEGRAM_BOT_USERNAME
+    ):
+        _persist_incoming(msg)
+        if not mark_seen(msg.update_id):
+            return _Prepared(response={"ok": True, "dedup": True})
+        return _Prepared(response={"ok": True, "ignored": True})
     normalized_text = " ".join(msg.text.casefold().split())
     phrase_judge = (
         ("judge us" in normalized_text or "who is right" in normalized_text)
@@ -266,30 +305,53 @@ def _prepare_message(msg: IncomingMessage) -> _Prepared:
     if judge_requested and not msg.is_edited:
         if not admins.is_admin(msg.user_id):
             _persist_incoming(msg)
-            mark_seen(msg.update_id)
-            return _Prepared(response=webhook_reply(msg.chat_id, "Only an administrator can run this command."))
+            if not mark_seen(msg.update_id):
+                return _Prepared(response={"ok": True, "dedup": True})
+            return _Prepared(
+                response=webhook_reply(
+                    msg.chat_id, "Only an administrator can run this command."
+                )
+            )
         context = list(reversed(history.recent(msg.chat_id, n=30)))
-        meaningful = [
-            record
-            for record in context
-            if str(record.get("text", "")).strip()
-            and not bool(record.get("is_service", False))
-        ]
-        human_authors = {
-            record.get("user_id")
-            for record in meaningful
-            if record.get("is_bot") is not True and isinstance(record.get("user_id"), int)
-        }
-        if len(meaningful) < 3 or len(human_authors) < 2:
-            _persist_incoming(msg)
-            mark_seen(msg.update_id)
-            return _Prepared(response=webhook_reply(msg.chat_id, "Not enough context to analyze this dispute."))
-        route = "deep_reply" if command == "deep" else "judge"
+        if command == "deep":
+            parts = msg.text.strip().split(maxsplit=1)
+            if len(parts) != 2 or not parts[1].strip():
+                _persist_incoming(msg)
+                if not mark_seen(msg.update_id):
+                    return _Prepared(response={"ok": True, "dedup": True})
+                return _Prepared(
+                    response=webhook_reply(msg.chat_id, "Usage: /deep <question>.")
+                )
+            request = _request_snapshot(msg, "deep_reply", context)
+            policy = _effective_policy(msg, "explicit")
+            indexed_users = _user_ids_in_record(request["trigger"])
+            for record in context:
+                indexed_users.update(_user_ids_in_record(record))
+            job = repository.create_reply_job(
+                request, policy, sorted(indexed_users)
+            )
+            _persist_job_trigger(job)
+            return _Prepared(job_id=job.job_id)
+
+        route = "judge"
         requested_n = 20
         explicit_n = False
         if command in {"judge", "dispute"}:
             parts = msg.text.strip().split()
-            if len(parts) > 1 and parts[1].isdigit():
+            if len(parts) > 1:
+                if (
+                    len(parts) != 2
+                    or not parts[1].isascii()
+                    or not parts[1].isdecimal()
+                ):
+                    _persist_incoming(msg)
+                    if not mark_seen(msg.update_id):
+                        return _Prepared(response={"ok": True, "dedup": True})
+                    return _Prepared(
+                        response=webhook_reply(
+                            msg.chat_id, f"Usage: /{command} [5-30]."
+                        )
+                    )
                 requested_n = int(parts[1])
                 explicit_n = True
         configured_n = config_store.get_config(msg.chat_id)["effective"].get(
@@ -298,9 +360,34 @@ def _prepare_message(msg: IncomingMessage) -> _Prepared:
         if not explicit_n:
             requested_n = configured_n if isinstance(configured_n, int) else 20
         requested_n = max(5, min(30, requested_n))
-        request = _request_snapshot(msg, route, meaningful[-requested_n:])
+        meaningful = [
+            record
+            for record in context
+            if str(record.get("text", "")).strip()
+            and not bool(record.get("is_service", False))
+        ][-requested_n:]
+        human_authors = {
+            record.get("user_id")
+            for record in meaningful
+            if record.get("is_bot") is not True
+            and isinstance(record.get("user_id"), int)
+        }
+        if len(meaningful) < 3 or len(human_authors) < 2:
+            _persist_incoming(msg)
+            if not mark_seen(msg.update_id):
+                return _Prepared(response={"ok": True, "dedup": True})
+            return _Prepared(
+                response=webhook_reply(
+                    msg.chat_id, "Not enough context to analyze this dispute."
+                )
+            )
+        request = _request_snapshot(msg, route, meaningful)
         request["judge_n"] = requested_n
-        policy = _effective_policy(msg, "judge" if route == "judge" else "explicit")
+        policy = _effective_policy(
+            msg,
+            "judge",
+            rule_text="\n".join(str(record["text"]) for record in meaningful),
+        )
         indexed_users = _user_ids_in_record(request["trigger"])
         for record in context:
             indexed_users.update(_user_ids_in_record(record))
@@ -310,16 +397,10 @@ def _prepare_message(msg: IncomingMessage) -> _Prepared:
     if msg.is_edited or command in {"ping", "help", "tone", "set_mode", "mode"}:
         _persist_incoming(msg)
         if not msg.is_edited and command in {"tone", "set_mode", "mode"}:
-            if command == "mode":
-                response = _tone_command_response(
-                    msg, command, update_id=msg.update_id
-                )
-                return _Prepared(response=response)
-            else:
-                response = _tone_command_response(
-                    msg, command, update_id=msg.update_id
-                )
-                return _Prepared(response=response)
+            response = _tone_command_response(
+                msg, command, update_id=msg.update_id
+            )
+            return _Prepared(response=response)
         if not mark_seen(msg.update_id):
             return _Prepared(response={"ok": True, "dedup": True})
         return _Prepared(
@@ -348,7 +429,9 @@ def _prepare_message(msg: IncomingMessage) -> _Prepared:
     context = list(reversed(history.recent(msg.chat_id, n=30)))
     request = _request_snapshot(msg, route, context)
     effective_policy = _effective_policy(
-        msg, "auto" if route == "auto_rule" else "explicit"
+        msg,
+        "auto" if route == "auto_rule" else "explicit",
+        matched_rules=auto_rules if route == "auto_rule" else None,
     )
     indexed_users = _user_ids_in_record(request["trigger"])
     for record in context:
