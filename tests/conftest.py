@@ -21,6 +21,7 @@ def fresh_store(monkeypatch):
     monkeypatch.setattr(settings, "TELEGRAM_ALLOWED_CHAT_ID", None)
     monkeypatch.setattr(settings, "ALLOW_UNFILTERED_LOCAL_CHATS", True)
     monkeypatch.setattr(settings, "NVIDIA_API_KEY", "")
+    monkeypatch.setattr(settings, "TAVILY_API_KEY", "")
     monkeypatch.setattr(settings, "QSTASH_TOKEN", "")
     monkeypatch.setattr(settings, "QSTASH_CURRENT_SIGNING_KEY", "")
     monkeypatch.setattr(settings, "QSTASH_NEXT_SIGNING_KEY", "")

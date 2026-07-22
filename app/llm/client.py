@@ -12,8 +12,6 @@ FLASH_TEMPERATURE: Final = 0.4
 FLASH_MAX_COMPLETION_TOKENS: Final = 2_048
 FLASH_TIMEOUT_SECONDS: Final = 180.0
 PRO_TIMEOUT_SECONDS: Final = 75.0
-EXPECTED_FLASH_MODEL: Final = "deepseek-ai/deepseek-v4-flash"
-EXPECTED_PRO_MODEL: Final = "deepseek-ai/deepseek-v4-pro"
 _MAX_RESPONSE_CHARS: Final = 64_000
 _THINK_BLOCK: Final = re.compile(
     r"<think\b[^>]*>.*?</think\s*>", re.DOTALL | re.IGNORECASE
@@ -57,14 +55,22 @@ def _create_flash_client(model: str, api_key: str) -> Any:
 
 
 def get_flash_client(config: Settings = settings) -> Any:
-    """Build an isolated non-thinking DeepSeek V4 Flash client for one invoke."""
-    if not config.NVIDIA_API_KEY or config.LLM_MODEL_FAST != EXPECTED_FLASH_MODEL:
+    """Build an isolated non-thinking NVIDIA client for one invoke."""
+    if (
+        not config.NVIDIA_API_KEY
+        or not isinstance(config.LLM_MODEL_FAST, str)
+        or not config.LLM_MODEL_FAST.strip()
+    ):
         raise LLMPermanentError("provider_configuration")
     return _create_flash_client(config.LLM_MODEL_FAST, config.NVIDIA_API_KEY)
 
 
 def get_pro_client(config: Settings = settings) -> Any:
-    if not config.NVIDIA_API_KEY or config.LLM_MODEL_SMART != EXPECTED_PRO_MODEL:
+    if (
+        not config.NVIDIA_API_KEY
+        or not isinstance(config.LLM_MODEL_SMART, str)
+        or not config.LLM_MODEL_SMART.strip()
+    ):
         raise LLMPermanentError("provider_configuration")
     from langchain_nvidia_ai_endpoints import ChatNVIDIA
 

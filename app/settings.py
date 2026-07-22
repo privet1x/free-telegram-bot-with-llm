@@ -93,8 +93,6 @@ settings = Settings()
 
 
 _WEBHOOK_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
-_EXPECTED_FLASH_MODEL = "deepseek-ai/deepseek-v4-flash"
-_EXPECTED_SMART_MODEL = "deepseek-ai/deepseek-v4-pro"
 _VERCEL_MAX_DURATION_SECONDS = 300
 # Three configured QStash retries use two 275-second minimum delays followed by
 # an exponential delay of roughly 1,808 seconds. One hour leaves additional
@@ -165,15 +163,17 @@ def production_bot_config_errors(config: Settings = settings) -> list[str]:
     errors = production_webhook_config_errors(config)
     required = {
         "NVIDIA_API_KEY": config.NVIDIA_API_KEY,
+        "LLM_MODEL_FAST": config.LLM_MODEL_FAST,
+        "LLM_MODEL_SMART": config.LLM_MODEL_SMART,
         "QSTASH_TOKEN": config.QSTASH_TOKEN,
         "QSTASH_CURRENT_SIGNING_KEY": config.QSTASH_CURRENT_SIGNING_KEY,
         "QSTASH_NEXT_SIGNING_KEY": config.QSTASH_NEXT_SIGNING_KEY,
     }
-    errors.extend(name for name, value in required.items() if not value)
-    if config.LLM_MODEL_FAST != _EXPECTED_FLASH_MODEL:
-        errors.append("LLM_MODEL_FAST")
-    if config.LLM_MODEL_SMART != _EXPECTED_SMART_MODEL:
-        errors.append("LLM_MODEL_SMART")
+    errors.extend(
+        name
+        for name, value in required.items()
+        if not isinstance(value, str) or not value.strip()
+    )
     if config.QSTASH_URL and not is_https_base_url(config.QSTASH_URL):
         errors.append("QSTASH_URL")
 

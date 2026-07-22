@@ -255,6 +255,19 @@ def test_flash_factory_uses_exact_model_limits_timeout_and_non_thinking_mode():
     assert base.model_kwargs == {}
 
 
+def test_factories_use_configured_model_ids():
+    configured = _settings(
+        LLM_MODEL_FAST="provider/custom-fast",
+        LLM_MODEL_SMART="provider/custom-smart",
+    )
+
+    flash = get_flash_client(configured).bound
+    pro = get_pro_client(configured).bound
+
+    assert flash.model == "provider/custom-fast"
+    assert pro.model == "provider/custom-smart"
+
+
 def test_judge_provider_timeouts_fit_worker_budget_with_terminal_reserve():
     from app.search.tavily import SEARCH_ATTEMPT_TIMEOUT_SECONDS
 

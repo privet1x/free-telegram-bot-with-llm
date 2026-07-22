@@ -25,8 +25,9 @@ authorized deployment check.
   production; the in-memory adapter exists only for local development and
   tests. History holds at most 30 messages and uses both a 30-day per-record
   cutoff and a sliding `HISTORY_RETENTION_SECONDS` list TTL.
-- **NVIDIA NIM** via LangChain `ChatNVIDIA` for
-  `deepseek-ai/deepseek-v4-flash` non-thinking replies.
+- **NVIDIA NIM** via LangChain `ChatNVIDIA` for configurable non-thinking
+  fast and smart model replies. The checked-in model IDs are defaults, not
+  runtime restrictions.
 - **Upstash QStash** to decouple slow LLM work from Telegram webhooks. QStash
   receives only an opaque job ID; snapshots remain in Redis.
 - **Telegram OIDC + server-side sessions** protect a same-origin vanilla
@@ -100,7 +101,9 @@ Configure:
 - `TELEGRAM_OIDC_CLIENT_ID` and `TELEGRAM_OIDC_CLIENT_SECRET` from BotFather
   Web Login configuration.
 
-Keep the checked-in defaults for `LLM_MODEL_FAST=deepseek-ai/deepseek-v4-flash`,
+The checked-in defaults are `LLM_MODEL_FAST=deepseek-ai/deepseek-v4-flash` and
+`LLM_MODEL_SMART=deepseek-ai/deepseek-v4-pro`; you may replace them with model
+IDs supported by your NVIDIA account. Keep the configured model names non-empty.
 `JOB_RETENTION_SECONDS=604800`, `WORKER_BUDGET_SECONDS=240`, and
 `JOB_LEASE_SECONDS=270`. The worker budget must remain shorter than the lease,
 which must remain shorter than Vercel's 300-second function duration.

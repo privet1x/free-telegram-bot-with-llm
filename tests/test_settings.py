@@ -88,12 +88,12 @@ def test_bot_readiness_is_independent_from_admin_oidc_configuration():
         ({"WORKER_BUDGET_SECONDS": 270}, "WORKER_BUDGET_SECONDS"),
         ({"JOB_LEASE_SECONDS": 240}, "JOB_LEASE_SECONDS"),
         ({"JOB_LEASE_SECONDS": 300}, "JOB_LEASE_SECONDS"),
-        ({"LLM_MODEL_FAST": "another-model"}, "LLM_MODEL_FAST"),
-        ({"LLM_MODEL_SMART": "another-model"}, "LLM_MODEL_SMART"),
         ({"QSTASH_URL": "http://qstash.example"}, "QSTASH_URL"),
         ({"QSTASH_CURRENT_SIGNING_KEY": ""}, "QSTASH_CURRENT_SIGNING_KEY"),
         ({"QSTASH_NEXT_SIGNING_KEY": ""}, "QSTASH_NEXT_SIGNING_KEY"),
         ({"NVIDIA_API_KEY": ""}, "NVIDIA_API_KEY"),
+        ({"LLM_MODEL_FAST": ""}, "LLM_MODEL_FAST"),
+        ({"LLM_MODEL_SMART": ""}, "LLM_MODEL_SMART"),
         ({"JOB_RETENTION_SECONDS": 3_599}, "JOB_RETENTION_SECONDS"),
         (
             {
