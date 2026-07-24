@@ -13,6 +13,7 @@ from app.telegram.job_contract import MAX_GENERATED_RESPONSE_CHARS
 MODEL_TEMPERATURE: Final = 1.0
 MODEL_TOP_P: Final = 0.95
 MODEL_MAX_COMPLETION_TOKENS: Final = 16_384
+MODEL_STANDARD_MAX_COMPLETION_TOKENS: Final = 4_096
 MODEL_TIMEOUT_SECONDS: Final = 180.0
 _THINK_BLOCK: Final = re.compile(
     r"<think\b[^>]*>.*?</think\s*>", re.DOTALL | re.IGNORECASE
@@ -66,7 +67,11 @@ def _create_client(model: str, api_key: str, *, thinking: bool) -> Any:
         api_key=api_key,
         temperature=MODEL_TEMPERATURE,
         top_p=MODEL_TOP_P,
-        max_completion_tokens=MODEL_MAX_COMPLETION_TOKENS,
+        max_completion_tokens=(
+            MODEL_MAX_COMPLETION_TOKENS
+            if thinking
+            else MODEL_STANDARD_MAX_COMPLETION_TOKENS
+        ),
         timeout=MODEL_TIMEOUT_SECONDS,
     )
     return base.with_thinking_mode(enabled=thinking)
@@ -76,16 +81,18 @@ def get_chat_client(
     *,
     thinking: bool = False,
     config: Settings = settings,
+    model: str | None = None,
 ) -> Any:
-    """Build an isolated Gemma client for one invocation."""
+    """Build an isolated NVIDIA model client for one invocation."""
+    selected_model = model if model is not None else config.LLM_MODEL
     if (
         not config.NVIDIA_API_KEY
-        or not isinstance(config.LLM_MODEL, str)
-        or not config.LLM_MODEL.strip()
+        or not isinstance(selected_model, str)
+        or not selected_model.strip()
     ):
         raise LLMPermanentError("provider_configuration")
     return _create_client(
-        config.LLM_MODEL,
+        selected_model,
         config.NVIDIA_API_KEY,
         thinking=thinking,
     )
@@ -195,9 +202,10 @@ async def generate(
     thinking: bool = False,
     config: Settings = settings,
     client: Any | None = None,
+    model: str | None = None,
 ) -> str:
     """Generate one bounded final response with optional private reasoning."""
-    llm = client or get_chat_client(thinking=thinking, config=config)
+    llm = client or get_chat_client(thinking=thinking, config=config, model=model)
     try:
         with timed("llm.inference"):
             async with asyncio.timeout(MODEL_TIMEOUT_SECONDS):

@@ -38,7 +38,8 @@ class Settings(BaseSettings):
 
     # NVIDIA NIM
     NVIDIA_API_KEY: str = ""
-    LLM_MODEL: str = "google/gemma-4-31b-it"
+    LLM_MODEL: str = "deepseek-ai/deepseek-v4-flash"
+    LLM_MODEL_VISION: str = "google/gemma-4-31b-it"
 
     # Explicit live web search for /google
     TAVILY_API_KEY: str = ""
@@ -164,6 +165,7 @@ def production_bot_config_errors(config: Settings = settings) -> list[str]:
     required = {
         "NVIDIA_API_KEY": config.NVIDIA_API_KEY,
         "LLM_MODEL": config.LLM_MODEL,
+        "LLM_MODEL_VISION": config.LLM_MODEL_VISION,
         "QSTASH_TOKEN": config.QSTASH_TOKEN,
         "QSTASH_CURRENT_SIGNING_KEY": config.QSTASH_CURRENT_SIGNING_KEY,
         "QSTASH_NEXT_SIGNING_KEY": config.QSTASH_NEXT_SIGNING_KEY,

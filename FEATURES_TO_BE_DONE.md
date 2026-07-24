@@ -65,7 +65,8 @@ Ticket 06 already provides:
   access controls to the model;
 - public `/ping`, `/help`, `/tone`, `/mode`, `/think`, and `/google`;
 - removed `/set_mode`, `/deep`, `/judge`, and `/dispute`;
-- one configurable `LLM_MODEL`, with `google/gemma-4-31b-it` as the default;
+- separate `LLM_MODEL` text and `LLM_MODEL_VISION` image/OCR settings, defaulting
+  to `deepseek-ai/deepseek-v4-flash` and `google/gemma-4-31b-it`;
 - non-thinking ordinary inference and thinking for `/think`, `/google`, and scheduled banter;
 - normally two-to-five-paragraph answers with model-selected useful length;
 - the stronger `sarcastic_bot` tone;

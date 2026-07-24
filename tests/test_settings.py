@@ -13,7 +13,8 @@ def test_env_example_is_a_valid_settings_template():
 
     assert configured.SUPER_ADMIN_ID is None
     assert configured.TELEGRAM_ALLOWED_CHAT_ID is None
-    assert configured.LLM_MODEL == "google/gemma-4-31b-it"
+    assert configured.LLM_MODEL == "deepseek-ai/deepseek-v4-flash"
+    assert configured.LLM_MODEL_VISION == "google/gemma-4-31b-it"
     assert configured.QSTASH_URL == "https://qstash.upstash.io"
     assert configured.HISTORY_RETENTION_SECONDS == 2_592_000
     assert configured.JOB_RETENTION_SECONDS == 604_800
@@ -91,6 +92,7 @@ def test_bot_readiness_is_independent_from_admin_oidc_configuration():
         ({"QSTASH_NEXT_SIGNING_KEY": ""}, "QSTASH_NEXT_SIGNING_KEY"),
         ({"NVIDIA_API_KEY": ""}, "NVIDIA_API_KEY"),
         ({"LLM_MODEL": ""}, "LLM_MODEL"),
+        ({"LLM_MODEL_VISION": ""}, "LLM_MODEL_VISION"),
         ({"JOB_RETENTION_SECONDS": 3_599}, "JOB_RETENTION_SECONDS"),
         (
             {

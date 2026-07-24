@@ -27,9 +27,10 @@ authorized deployment check.
   production; the in-memory adapter exists only for local development and
   tests. History holds at most 30 messages and uses both a 30-day per-record
   cutoff and a sliding `HISTORY_RETENTION_SECONDS` list TTL.
-- **NVIDIA NIM** via LangChain `ChatNVIDIA` for one configured model. The
-  checked-in `LLM_MODEL` default is `google/gemma-4-31b-it`; the application
-  deliberately does not enforce a model allowlist.
+- **NVIDIA NIM** via LangChain `ChatNVIDIA`: `LLM_MODEL` handles text replies
+  and `LLM_MODEL_VISION` handles image/OCR jobs. Defaults are DeepSeek V4 Flash
+  for text and Gemma 4 31B IT for vision; the application deliberately does not
+  enforce a model allowlist.
 - **Upstash QStash** to decouple slow LLM work from Telegram webhooks. QStash
   receives only an opaque job ID; snapshots remain in Redis.
 - **Telegram OIDC + server-side sessions** protect a same-origin vanilla
@@ -105,9 +106,10 @@ Configure:
 - `TELEGRAM_OIDC_CLIENT_ID` and `TELEGRAM_OIDC_CLIENT_SECRET` from BotFather
   Web Login configuration.
 
-Set `LLM_MODEL=google/gemma-4-31b-it` for this deployment. There is one model
-setting for every generated path; the code checks that it is non-empty but does
-not restrict you to a compiled allowlist.
+Set `LLM_MODEL=deepseek-ai/deepseek-v4-flash` and
+`LLM_MODEL_VISION=google/gemma-4-31b-it` for this deployment. Text and vision
+paths are configured separately; both values are checked for non-empty strings
+but are not restricted to a compiled allowlist.
 `JOB_RETENTION_SECONDS=604800`, `WORKER_BUDGET_SECONDS=240`, and
 `JOB_LEASE_SECONDS=270`. The worker budget must remain shorter than the lease,
 which must remain shorter than Vercel's 300-second function duration.

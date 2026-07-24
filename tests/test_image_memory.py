@@ -151,9 +151,11 @@ def test_analyze_image_uses_multimodal_message_and_persists_result(monkeypatch):
     )
     monkeypatch.setattr(image_memory, "download_file", lambda _path, **_kwargs: b"jpeg")
     captured: list[object] = []
+    generation_options: list[dict[str, object]] = []
 
-    async def fake_generate(messages, **_kwargs):
+    async def fake_generate(messages, **kwargs):
         captured.extend(messages)
+        generation_options.append(kwargs)
         return '{"ocr":"тест","summary":"картинка"}'
 
     monkeypatch.setattr(image_memory, "generate", fake_generate)
@@ -170,6 +172,9 @@ def test_analyze_image_uses_multimodal_message_and_persists_result(monkeypatch):
     assert result == "OCR: тест\nОписание: картинка"
     assert "image_url" in repr(captured)
     assert "image_analysis" in gathered_for_user(100, 5)[0]
+    assert generation_options == [
+        {"thinking": False, "model": "google/gemma-4-31b-it"}
+    ]
 
 
 def test_captionless_image_creates_durable_memory_job_when_qstash_is_configured(

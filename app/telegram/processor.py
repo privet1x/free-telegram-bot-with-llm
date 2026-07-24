@@ -58,7 +58,11 @@ from app.store.jobs import (
     get_job_repository,
 )
 from app.telegram import client as telegram_client
-from app.telegram.addressing import address_text, normalize_first_name
+from app.telegram.addressing import (
+    address_text,
+    normalize_first_name,
+    remove_model_address,
+)
 from app.telegram.identity import BotIdentity, BotIdentityUnavailable, get_bot_identity
 from app.telegram.job_contract import JOB_SNAPSHOT_VERSION, SUPPORTED_JOB_KINDS
 
@@ -233,7 +237,8 @@ def _author_first_name(job: JobRecord) -> str:
 def _addressed(job: JobRecord, text: str) -> str:
     if job.request.get("kind") == "scheduled":
         return text.strip()
-    addressed = address_text(_author_first_name(job), text)
+    first_name = _author_first_name(job)
+    addressed = address_text(first_name, remove_model_address(first_name, text))
     if not addressed:
         raise _PermanentWork("job_snapshot_invalid")
     return addressed

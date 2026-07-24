@@ -3,8 +3,8 @@
 ## Goal
 
 Replace the legacy judge/admin-command conversation contract with one immutable
-assistant identity, deterministic Telegram-first-name addressing, one NVIDIA
-Gemma model, and a small public command surface.
+assistant identity, deterministic Telegram-first-name addressing, separate NVIDIA
+text and vision models, and a small public command surface.
 
 This ticket intentionally supersedes the conversational parts of Tickets 03 and
 04. The web control plane remains owner-only.
@@ -34,13 +34,13 @@ This ticket intentionally supersedes the conversational parts of Tickets 03 and
   Tavily.
 - Mentions, replies, automatic rules, and ordinary commands use non-thinking
   inference.
-- Every LLM path uses the single configured `LLM_MODEL`.
-  `google/gemma-4-31b-it` is the checked-in default and recommended deployment
-  value for this bot. The operator may choose another compatible NVIDIA model;
-  the application deliberately does not hard-code a model allowlist. All paths
-  use `temperature=1`, `top_p=0.95`, and a 16,384-token hard completion ceiling.
-  Prompts request two to five paragraphs and let the model choose the useful
-  length inside that bound.
+- Text LLM paths use `LLM_MODEL`; image/OCR uses `LLM_MODEL_VISION`, defaulting
+  to `deepseek-ai/deepseek-v4-flash` and `google/gemma-4-31b-it`. The operator
+  may choose other compatible NVIDIA models; the application deliberately does
+  not hard-code a model allowlist. All paths use `temperature=1` and
+  `top_p=0.95`; ordinary replies use a 4,096-token ceiling and thinking routes
+  retain the 16,384-token ceiling. Prompts request concise one-to-three-paragraph
+  answers and direct factual/image answers without forced jokes.
 - The canonical sarcastic preset is `sarcastic_bot`. Legacy
   `sarcastic_robot` records are migrated on read.
 

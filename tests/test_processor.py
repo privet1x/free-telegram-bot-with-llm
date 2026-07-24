@@ -933,7 +933,7 @@ def test_standard_reply_disables_thinking_and_prefixes_saved_answer(
         _messages: list[object], *, thinking: bool = False
     ) -> str:
         modes.append(thinking)
-        return "Final answer."
+        return "Alice, Alice, Final answer."
 
     monkeypatch.setattr(processor, "generate", generate)
 

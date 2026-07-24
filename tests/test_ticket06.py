@@ -26,10 +26,11 @@ def test_current_telegram_first_name_is_the_only_delivery_name():
 
 
 def test_code_addressing_prefix_uses_only_the_verified_first_name():
-    from app.telegram.addressing import address_text
+    from app.telegram.addressing import address_text, remove_model_address
 
     assert address_text("Alice", "The answer.") == "Alice, The answer."
     assert address_text(" Alice ", "  The answer.  ") == "Alice, The answer."
+    assert remove_model_address("Alice", "Alice, Alice, The answer.") == "The answer."
 
 
 def test_immutable_super_context_excludes_runtime_identity_and_admin_policy():
@@ -61,13 +62,31 @@ def test_immutable_super_context_excludes_runtime_identity_and_admin_policy():
     system = str(messages[0].content)
     data = json.loads(str(messages[1].content))
     assert "неизменяемый супер-контекст" in system.casefold()
-    assert "от двух до пяти" in system.casefold()
+    assert "один-три коротких" in system.casefold()
     assert "не добавляй вступительное имя" in system.casefold()
     assert "RUNTIME_REPLACEMENT_CANARY" not in system
     assert "UNTRUSTED_FIRST_NAME" not in system
     assert "is_admin" not in system
     assert "administrator status" not in system.casefold()
     assert data["author"]["name"] == "UNTRUSTED_FIRST_NAME"
+
+
+def test_image_reply_prompt_requests_direct_description_without_forced_jokes():
+    messages = build_reply_messages(
+        {
+            "request": {
+                "kind": "reply",
+                "author": {"id": 5, "name": "Alice"},
+                "context": [],
+                "trigger": {"message_id": 10, "text": "что на фото?"},
+                "image": {"file_id": "photo"},
+            },
+            "effective_policy": {"tone_preset": "sarcastic_bot"},
+        }
+    )
+    system = str(messages[0].content)
+    assert "запрос по изображению" in system
+    assert "Не добавляй шутку" in system
 
 
 def test_legacy_tone_configuration_migrates_without_editable_prompt():

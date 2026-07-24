@@ -2,7 +2,7 @@
 
 This is an operator and manual acceptance-test guide for the Telegram group bot in this repository. Follow it in order for the first deployment. The later sections can be reused as a release checklist.
 
-The bot is intentionally scoped to one Telegram group. It records that group's conversation history, answers mentions and replies with one configured NVIDIA model, can automatically react through rules, and provides public `/think` and `/google` commands. The owner-only web panel manages user policies, rules, tone, logs, and privacy deletion.
+The bot is intentionally scoped to one Telegram group. It records that group's conversation history, answers mentions and replies with a fast text model, uses a separate vision model for image/OCR jobs, can automatically react through rules, and provides public `/think` and `/google` commands. The owner-only web panel manages user policies, rules, tone, logs, and privacy deletion.
 
 > **Privacy and cost warning:** use a private test group first. Tell every participant that the bot stores messages and may send selected content to NVIDIA-hosted models. When a participant explicitly uses `/google`, its bounded query is sent to Tavily; recent group history is not sent to Tavily. Do not test with private or sensitive conversations.
 
@@ -125,10 +125,14 @@ QStash moves slow LLM work out of the Telegram webhook. Its console's **Logs** v
 ### 3.3 NVIDIA models
 
 1. Sign in to the existing account at [build.nvidia.com](https://build.nvidia.com/).
-2. Confirm the existing `NVIDIA_API_KEY` can access the model configured in `LLM_MODEL`.
-3. Use `LLM_MODEL=google/gemma-4-31b-it` for this deployment. The code deliberately checks only that the one model value is non-empty, so changing it later does not require a code change.
+2. Confirm the existing `NVIDIA_API_KEY` can access the models configured in `LLM_MODEL` and `LLM_MODEL_VISION`.
+3. Use `LLM_MODEL=deepseek-ai/deepseek-v4-flash` for text and
+   `LLM_MODEL_VISION=google/gemma-4-31b-it` for image/OCR jobs. The code checks
+   both values are non-empty but does not restrict you to a compiled allowlist.
 
-The same model handles every generated response. Thinking is disabled for normal and automatic replies, and enabled only for `/think` and `/google`.
+Thinking is disabled for normal and automatic replies, and enabled only for
+`/think`, `/google`, and scheduled banter. Standard replies use a smaller output
+budget; thinking routes retain the larger budget.
 
 ### 3.4 Tavily
 
@@ -262,7 +266,8 @@ The following tables are an audit inventory, not instructions to generate new va
 | `TELEGRAM_ALLOWED_CHAT_ID` | Keep existing negative numeric group ID |
 | `ALLOW_UNFILTERED_LOCAL_CHATS` | `false` |
 | `NVIDIA_API_KEY` | Keep existing `.env` value |
-| `LLM_MODEL` | `google/gemma-4-31b-it` |
+| `LLM_MODEL` | `deepseek-ai/deepseek-v4-flash` |
+| `LLM_MODEL_VISION` | `google/gemma-4-31b-it` |
 | `UPSTASH_REDIS_REST_URL` | Keep existing `.env` value |
 | `UPSTASH_REDIS_REST_TOKEN` | Keep existing `.env` value |
 | `QSTASH_URL` | Keep existing `.env` value |

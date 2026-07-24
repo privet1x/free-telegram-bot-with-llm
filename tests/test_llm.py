@@ -25,7 +25,8 @@ from app.telegram.job_contract import MAX_GENERATED_RESPONSE_CHARS
 def _settings(**overrides: object) -> Settings:
     values: dict[str, object] = {
         "NVIDIA_API_KEY": "nvidia-test-key",
-        "LLM_MODEL": "google/gemma-4-31b-it",
+        "LLM_MODEL": "deepseek-ai/deepseek-v4-flash",
+        "LLM_MODEL_VISION": "google/gemma-4-31b-it",
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)
@@ -144,7 +145,7 @@ def test_llm_client_module_import_is_lazy():
 
 
 @pytest.mark.parametrize("thinking", [False, True])
-def test_gemma_factory_uses_one_model_exact_sampling_and_isolated_clients(
+def test_text_factory_uses_fast_model_and_shorter_standard_budget(
     thinking: bool,
 ):
     client = get_chat_client(thinking=thinking, config=_settings())
@@ -154,26 +155,27 @@ def test_gemma_factory_uses_one_model_exact_sampling_and_isolated_clients(
     assert client.bound._async_client is not separate.bound._async_client
     assert client.kwargs == {"thinking_mode": thinking}
     base = client.bound
-    assert base.model == "google/gemma-4-31b-it"
+    assert base.model == "deepseek-ai/deepseek-v4-flash"
     assert base.temperature == 1.0
     assert base.top_p == 0.95
-    assert base.max_tokens == 16_384
+    assert base.max_tokens == (16_384 if thinking else 4_096)
     assert base._client.timeout == 180.0
     assert base._async_client.timeout == 180.0
 
 
-def test_gemma_factory_rejects_missing_configuration_safely():
-    for configured in (
-        _settings(NVIDIA_API_KEY=""),
-        _settings(LLM_MODEL=""),
+def test_model_factory_rejects_missing_configuration_safely():
+    for configured, model in (
+        (_settings(NVIDIA_API_KEY=""), None),
+        (_settings(LLM_MODEL=""), None),
+        (_settings(LLM_MODEL_VISION=""), ""),
     ):
         with pytest.raises(LLMPermanentError) as raised:
-            get_chat_client(config=configured)
+            get_chat_client(config=configured, model=model)
         assert raised.value.error_class == "provider_configuration"
 
 
 @pytest.mark.parametrize("thinking", [False, True])
-def test_real_chatnvidia_payload_pins_gemma_thinking_shape(
+def test_real_chatnvidia_payload_pins_text_model_thinking_shape(
     monkeypatch: pytest.MonkeyPatch,
     thinking: bool,
 ):
@@ -195,7 +197,7 @@ def test_real_chatnvidia_payload_pins_gemma_thinking_shape(
                 "id": "completion-1",
                 "object": "chat.completion",
                 "created": 1,
-                "model": "google/gemma-4-31b-it",
+                "model": "deepseek-ai/deepseek-v4-flash",
                 "choices": [
                     {
                         "index": 0,
@@ -225,12 +227,12 @@ def test_real_chatnvidia_payload_pins_gemma_thinking_shape(
                 {"role": "system", "content": "trusted"},
                 {"role": "user", "content": "data"},
             ],
-            "model": "google/gemma-4-31b-it",
+            "model": "deepseek-ai/deepseek-v4-flash",
             "temperature": 1.0,
             "top_p": 0.95,
-            "max_tokens": 16_384,
+            "max_tokens": 16_384 if thinking else 4_096,
             "stream": False,
-            "chat_template_kwargs": {"enable_thinking": thinking},
+            "chat_template_kwargs": {"thinking": thinking},
         }
     ]
 

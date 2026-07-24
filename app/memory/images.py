@@ -9,6 +9,7 @@ from collections.abc import Mapping
 
 from app.llm.client import generate
 from app.memory.store import attach_image_analysis, gathered_for_user
+from app.settings import settings
 from app.telegram.client import (
     MAX_TELEGRAM_IMAGE_BYTES,
     download_file,
@@ -123,7 +124,9 @@ def analyze_image(request: Mapping[str, object]) -> str | None:
             ],
         },
     ]
-    raw = asyncio.run(generate(messages, thinking=False))
+    raw = asyncio.run(
+        generate(messages, thinking=False, model=settings.LLM_MODEL_VISION)
+    )
     analysis = _extract_analysis(raw)
     if not analysis:
         return None

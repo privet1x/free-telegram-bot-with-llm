@@ -14,7 +14,7 @@ and privacy contract are in [00-ARCHITECTURE.md](00-ARCHITECTURE.md).
 | 03 | [Rules, lists, and tone](03-rules-triggers-tone.md) | Deterministic policies and unmentioned automatic routing | 02 |
 | 04 | [Judge and grounded facts](04-dispute-resolution-judge.md) | Historical judge workflow, superseded by Ticket 06 | 03 |
 | 05 | [Web admin](05-admin-panel.md) | Telegram OIDC, secure session, CRUD/UI, and privacy purge | 04 |
-| 06 | [Trusted conversation and public commands](06-trusted-conversation-and-public-commands.md) | Deterministic first-name addressing, immutable super-context, one Gemma model, `/think`, and `/google` | 05 |
+| 06 | [Trusted conversation and public commands](06-trusted-conversation-and-public-commands.md) | Deterministic first-name addressing, immutable super-context, separate fast text and vision models, `/think`, and `/google` | 05 |
 | 07 | Per-user memory and `/lobotomy` | Immutable participant shards, bounded gathered observations, epoch-safe mutable-memory reset | 06 |
 | 08 | Always-on reactions and scheduled banter | Hard-coded Russian keyword reactions and authenticated twenty-minute scheduled messages | 07 |
 
@@ -26,8 +26,8 @@ and privacy contract are in [00-ARCHITECTURE.md](00-ARCHITECTURE.md).
 
 - The bot serves exactly one private `TELEGRAM_ALLOWED_CHAT_ID`; other chats are
   acknowledged but never persisted.
-- Every generated response uses one configured NVIDIA NIM model; the deployment
-  value and checked-in default are `google/gemma-4-31b-it`. Ordinary replies
+- Text replies use `LLM_MODEL` and image/OCR uses `LLM_MODEL_VISION`. Defaults are
+  `deepseek-ai/deepseek-v4-flash` and `google/gemma-4-31b-it`. Ordinary replies
   are non-thinking; public `/think`, `/google`, and scheduled banter enable model
   thinking.
 - `/google` sends only the bounded query that the participant explicitly placed

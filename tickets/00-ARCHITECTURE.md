@@ -14,7 +14,7 @@ people, with a web UI, dynamic LLM behaviour, and a recent-message buffer.
 | Hosting | Vercel Hobby, Python 3.12, one FastAPI application |
 | Telegram | Webhook; Privacy Mode disabled or the bot is a group admin. Ticket 05 requires bot group-admin status for reliable getChatMember use. |
 | Access boundary | Exactly one TELEGRAM_ALLOWED_CHAT_ID. Other groups and private chats receive 200 but are not logged or processed. |
-| Primary LLM | One `LLM_MODEL` for every response; deployment default is NVIDIA NIM google/gemma-4-31b-it |
+| Primary LLM | `LLM_MODEL` for text replies and `LLM_MODEL_VISION` for image/OCR; defaults are NVIDIA NIM deepseek-ai/deepseek-v4-flash and google/gemma-4-31b-it |
 | Thinking routes | Public /think, /google, and scheduled banter; all other routes are non-thinking |
 | LLM wrapper | langchain-nvidia-ai-endpoints==1.4.3 and asynchronous ChatNVIDIA with a request-shape contract for Gemma thinking on/off |
 | Queue | Upstash QStash. Webhook writes a Redis job/snapshot and publishes only an opaque job_id. |
@@ -372,7 +372,8 @@ TELEGRAM_WEBHOOK_SECRET=replace_with_random_secret
 TELEGRAM_ALLOWED_CHAT_ID=-1000000000000
 
 NVIDIA_API_KEY=replace_me
-LLM_MODEL=google/gemma-4-31b-it
+LLM_MODEL=deepseek-ai/deepseek-v4-flash
+LLM_MODEL_VISION=google/gemma-4-31b-it
 
 UPSTASH_REDIS_REST_URL=https://replace-me.upstash.io
 UPSTASH_REDIS_REST_TOKEN=replace_me
@@ -399,9 +400,9 @@ AUTO_TRIGGER_COOLDOWN_SECONDS=30
 Pin direct dependencies including FastAPI, pydantic-settings, httpx,
 upstash-redis, qstash, langchain-nvidia-ai-endpoints==1.4.3, and PyJWT[crypto].
 
-The single Gemma factory calls with_thinking_mode(enabled=False) for ordinary
-work and enabled=True only for /think and /google. In the pinned wrapper and
-current NVIDIA model profile this maps to
+The text and vision factories call with_thinking_mode(enabled=False) for ordinary
+work and enabled=True only for thinking routes. In the pinned wrapper and
+current NVIDIA model profiles this maps to
 chat_template_kwargs.enable_thinking=false/true. Contract tests capture both
 outgoing request shapes. Do not send a literal root extra_body or an unverified
 root reasoning_effort.
