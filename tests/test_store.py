@@ -246,7 +246,36 @@ def test_upstash_history_upsert_uses_one_atomic_eval():
     assert calls[0][2][3:5] == ["30", "300"]
 
 
-def test_upstash_tone_command_uses_partial_chat_patch_and_atomic_receipts():
+def test_memory_exact_value_and_receipts_replace_legacy_configuration():
+    kv = MemoryKV()
+    kv.set("cfg:100", '{"tone_preset":"neutral","removed":"legacy"}')
+
+    assert kv.set_value_with_receipts(
+        "cfg:100",
+        "cmd:1",
+        "dedup:update:1",
+        '{"tone_preset":"scientist"}',
+        2_592_000,
+        86_400,
+    )
+    assert kv.get("cfg:100") == '{"tone_preset":"scientist"}'
+    assert kv.get("cmd:1") == "done"
+    assert kv.get("dedup:update:1") == "done"
+    assert (
+        kv.set_value_with_receipts(
+            "cfg:100",
+            "cmd:1",
+            "dedup:update:1",
+            '{"tone_preset":"street"}',
+            2_592_000,
+            86_400,
+        )
+        is False
+    )
+    assert kv.get("cfg:100") == '{"tone_preset":"scientist"}'
+
+
+def test_upstash_tone_command_uses_exact_value_and_atomic_receipts():
     calls = []
 
     class FakeRedis:
@@ -256,22 +285,21 @@ def test_upstash_tone_command_uses_partial_chat_patch_and_atomic_receipts():
 
     kv = UpstashKV.__new__(UpstashKV)
     kv._r = FakeRedis()
-    patch = '{"tone_mode":"preset","tone_preset":"scientist"}'
+    value = '{"tone_preset":"scientist"}'
 
-    assert kv.apply_json_patch_with_receipts(
+    assert kv.set_value_with_receipts(
         "cfg:100",
         "cmd:1",
         "dedup:update:1",
-        patch,
-        "{}",
+        value,
         2_592_000,
         86_400,
     )
 
     script, keys, args = calls[0]
     assert keys == ["cfg:100", "cmd:1", "dedup:update:1"]
-    assert args == [patch, "{}", "2592000", "86400"]
-    assert "for key, item in pairs(patch)" in script
+    assert args == [value, "2592000", "86400"]
+    assert "cjson" not in script
     assert script.count("redis.call('SET'") == 3
 
 
@@ -542,6 +570,21 @@ def test_observed_user_username_index_tracks_renames():
 
     assert users.resolve_username("alice") is None
     assert users.resolve_username("@ALICE_NEW")["id"] == 42
+
+
+def test_observed_user_name_is_bounded_and_control_free():
+    profile = users.observe(
+        {
+            "id": 43,
+            "username": "bounded_name",
+            "name": "A\x00" + ("b" * 100),
+            "is_bot": False,
+            "last_seen_at": 100,
+        }
+    )
+
+    assert profile["name"] == "A" + ("b" * 63)
+    assert len(profile["name"]) == 64
 
 
 def test_observed_user_rename_retry_does_not_leave_old_alias(monkeypatch):

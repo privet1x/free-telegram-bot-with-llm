@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from app.settings import settings
 from app.store.redis import get_store
 from app.telegram import client as telegram_client
-from app.telegram.models import MAX_USERNAME_CHARS
+from app.telegram.addressing import normalize_first_name
+from app.telegram.models import MAX_NAME_CHARS, MAX_USERNAME_CHARS
 
 BOT_IDENTITY_KEY = "bot:self"
 BOT_IDENTITY_CACHE_SECONDS = 86_400
@@ -24,6 +25,7 @@ class BotIdentity:
 
     id: int
     username: str
+    first_name: str
 
 
 class BotIdentityUnavailable(RuntimeError):
@@ -57,15 +59,20 @@ def _verified_identity(value: object, expected_username: str) -> BotIdentity | N
         return None
     bot_id = _strict_positive_int(value.get("id"))
     username = value.get("username")
+    raw_first_name = value.get("first_name")
+    first_name = normalize_first_name(raw_first_name)
     if (
         bot_id is None
         or not isinstance(username, str)
         or not username
         or len(username) > MAX_USERNAME_CHARS
         or username.casefold() != expected_username.casefold()
+        or not isinstance(raw_first_name, str)
+        or not first_name
+        or len(raw_first_name) > MAX_NAME_CHARS
     ):
         return None
-    return BotIdentity(id=bot_id, username=username)
+    return BotIdentity(id=bot_id, username=username, first_name=first_name)
 
 
 def _decode_cached(raw: object, expected_username: str) -> BotIdentity | None:
@@ -104,8 +111,12 @@ def get_bot_identity() -> BotIdentity:
             if identity is None:
                 raise BotIdentityUnavailable()
             encoded = json.dumps(
-                {"id": identity.id, "username": identity.username},
-                ensure_ascii=True,
+                {
+                    "id": identity.id,
+                    "username": identity.username,
+                    "first_name": identity.first_name,
+                },
+                ensure_ascii=False,
                 separators=(",", ":"),
             )
             store.set(

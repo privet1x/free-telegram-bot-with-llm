@@ -13,6 +13,8 @@ from app.store.redis import get_store
 RULES_INDEX_KEY = "rules:index"
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _MATCH_TYPES = {"substring", "word", "phrase"}
+# Keep the legacy judge value readable until old Redis records expire. Current
+# API schemas accept only auto, explicit, and all.
 _SCOPES = {"auto", "explicit", "judge", "all"}
 _MAX_INSTRUCTION = 8_000
 _MAX_MATCH_VALUE = 512

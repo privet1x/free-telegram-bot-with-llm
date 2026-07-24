@@ -92,13 +92,12 @@ class KV(Protocol):
     def increment(self, key: str) -> int: ...
     def admin_role_change(self, user_id: int, *, add: bool) -> bool: ...
     def rate_limit(self, key: str, limit: int, window_seconds: int) -> bool: ...
-    def apply_json_patch_with_receipts(
+    def set_value_with_receipts(
         self,
         target_key: str,
         command_key: str,
         dedup_key: str,
-        patch_json: Optional[str],
-        default_json: str,
+        value: str,
         command_ttl: int,
         dedup_ttl: int,
     ) -> bool: ...
@@ -568,38 +567,20 @@ class MemoryKV:
             self._set_unlocked(key, str(count), ttl)
             return count <= limit
 
-    def apply_json_patch_with_receipts(
+    def set_value_with_receipts(
         self,
         target_key: str,
         command_key: str,
         dedup_key: str,
-        patch_json: Optional[str],
-        default_json: str,
+        value: str,
         command_ttl: int,
         dedup_ttl: int,
     ) -> bool:
         with self._lock:
             self._purge_if_expired(command_key)
-            self._purge_if_expired(target_key)
             if command_key in self._values:
                 return False
-            if patch_json is None:
-                self._values.pop(target_key, None)
-                self._expiry.pop(target_key, None)
-            else:
-                try:
-                    current = json.loads(self._values.get(target_key, default_json))
-                    patch = json.loads(patch_json)
-                except (TypeError, ValueError):
-                    raise ValueError("stored JSON is corrupt") from None
-                if not isinstance(current, dict) or not isinstance(patch, dict):
-                    raise ValueError("stored JSON is corrupt")
-                current.update(patch)
-                self._set_unlocked(
-                    target_key,
-                    json.dumps(current, ensure_ascii=False, separators=(",", ":")),
-                    None,
-                )
+            self._set_unlocked(target_key, value, None)
             self._set_unlocked(command_key, "done", command_ttl)
             self._set_unlocked(dedup_key, "done", dedup_ttl)
             return True
@@ -1270,29 +1251,20 @@ class UpstashKV:
             )
         )
 
-    def apply_json_patch_with_receipts(
+    def set_value_with_receipts(
         self,
         target_key: str,
         command_key: str,
         dedup_key: str,
-        patch_json: Optional[str],
-        default_json: str,
+        value: str,
         command_ttl: int,
         dedup_ttl: int,
     ) -> bool:
         script = """
         if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
-        if ARGV[1] == '' then
-          redis.call('DEL', KEYS[1])
-        else
-          local raw = redis.call('GET', KEYS[1]) or ARGV[2]
-          local value = cjson.decode(raw)
-          local patch = cjson.decode(ARGV[1])
-          for key, item in pairs(patch) do value[key] = item end
-          redis.call('SET', KEYS[1], cjson.encode(value))
-        end
-        redis.call('SET', KEYS[2], 'done', 'EX', ARGV[3])
-        redis.call('SET', KEYS[3], 'done', 'EX', ARGV[4])
+        redis.call('SET', KEYS[1], ARGV[1])
+        redis.call('SET', KEYS[2], 'done', 'EX', ARGV[2])
+        redis.call('SET', KEYS[3], 'done', 'EX', ARGV[3])
         return 1
         """
         return bool(
@@ -1301,8 +1273,7 @@ class UpstashKV:
                 script,
                 keys=[target_key, command_key, dedup_key],
                 args=[
-                    patch_json or "",
-                    default_json,
+                    value,
                     str(command_ttl),
                     str(dedup_ttl),
                 ],

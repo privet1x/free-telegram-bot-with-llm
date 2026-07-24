@@ -36,7 +36,7 @@ def main() -> int:
                 "title": "Sarcastic response",
                 "enabled": True,
                 "priority": 50,
-                "applies_to": ["explicit", "auto", "judge"],
+                "applies_to": ["explicit", "auto"],
                 "injected_prompt": "Use dry sarcasm without personal attacks.",
             },
         ]

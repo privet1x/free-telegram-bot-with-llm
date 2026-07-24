@@ -17,7 +17,7 @@ from app.auth import session
 from app.auth.telegram_oidc import consume_state, create_state
 from app.auth.membership import require_group_member
 from app.settings import settings
-from app.search.tavily import sanitize_query
+from app.search.tavily import normalize_explicit_query
 from app.store import config_store, history, lists, users
 from app.store import admins
 from app.store.redis import get_store
@@ -289,6 +289,8 @@ def test_admin_assignment_requires_current_group_member(client, monkeypatch):
     assert response.status_code == 201
     assert response.json()["user_id"] == 202
     assert seen == [202]
+    with pytest.raises(PermissionError, match="owner"):
+        session.issue_session(202)
 
 
 def test_admin_json_models_reject_unknown_fields(client, monkeypatch):
@@ -572,10 +574,35 @@ def test_full_chat_purge_requires_exact_confirmation(client, monkeypatch):
 def test_admin_frontend_has_management_sections_without_inner_html():
     html = Path("public/index.html").read_text(encoding="utf-8")
     javascript = Path("public/app.js").read_text(encoding="utf-8")
-    for section in ("users", "admins", "lists", "rules", "tone", "logs", "privacy"):
+    readme = Path("README.md").read_text(encoding="utf-8")
+    for section in ("users", "lists", "rules", "tone", "logs", "privacy"):
         assert f'id="{section}"' in html
+    assert 'id="admins"' not in html
+    assert "custom system prompt" not in html.casefold()
+    assert "judge context" not in html.casefold()
     assert "innerHTML" not in javascript
     assert "textContent" in javascript
+    assert "Durable model-job snapshots" in javascript
+    assert "Recent group history is not sent to Tavily." in javascript
+    assert "Expired records are excluded and removed on the next access." in javascript
+    assert "Math.round" not in javascript
+    assert "${retention.history_seconds} seconds" in javascript
+    assert "${retention.job_seconds} seconds" in javascript
+    assert 'id="owner-contact"' in html
+    assert 'id="copy-notice" type="button" disabled' in html
+    assert "copyButton.disabled = !contact" in javascript
+    assert "restoreButtonStates();" in javascript
+    assert 'button.id === "copy-notice" && !hasOwnerContact' in javascript
+    assert (
+        'document.querySelectorAll("button").forEach((button) => '
+        "{ button.disabled = false; });"
+    ) not in javascript
+    assert "Enter a monitored owner contact before copying." in javascript
+    assert "REPLACE WITH OWNER CONTACT" not in javascript
+    assert "30 days by default" not in readme
+    assert "exact configured retention values" in readme
+    guide = Path("HOW_TO_RUN_AND_TEST_ALL_FEATURES.md").read_text(encoding="utf-8")
+    assert "Enter a monitored owner contact" in guide
 
 
 def test_hostile_admin_and_history_strings_remain_plain_text_data(
@@ -625,20 +652,22 @@ def test_hostile_admin_and_history_strings_remain_plain_text_data(
     assert "body.textContent = details" in javascript
 
 
-def test_session_is_server_backed_and_role_removal_revokes_immediately(monkeypatch):
+def test_session_is_server_backed_and_assigned_roles_never_grant_access(monkeypatch):
     _configure_admin(monkeypatch)
     admins.add_admin(202)
-    checks: list[bool] = []
+    with pytest.raises(PermissionError, match="owner"):
+        session.issue_session(202)
 
-    def member(_user_id: int, **kwargs):
-        checks.append(bool(kwargs.get("allow_cache")))
-        return {"id": 202}
-
-    monkeypatch.setattr("app.auth.session.require_group_member", member)
-    token, _csrf = session.issue_session(202)
-    assert session.require_session(token) == 202
-    assert checks == [False, True]
-    admins.remove_admin(202)
+    token, _csrf = session.issue_session(101)
+    assert session.require_session(token) == 101
+    claims = jwt.decode(
+        token,
+        settings.SESSION_SECRET,
+        algorithms=["HS256"],
+        audience="kulajaj-admin",
+        issuer="kulajaj",
+    )
+    get_store().delete(f"session:{claims['jti']}")
     with pytest.raises(PermissionError):
         session.require_session(token)
 
@@ -748,68 +777,43 @@ def test_session_server_record_cannot_be_swapped_between_tokens(monkeypatch):
     # cross-user substitution is the security boundary.
     assert session.require_session(first) == 101
 
-    admins.add_admin(202)
-    monkeypatch.setattr(
-        "app.auth.session.require_group_member", lambda *_args, **_kwargs: {"id": 202}
-    )
-    assigned, _csrf = session.issue_session(202)
-    assigned_claims = jwt.decode(
-        assigned,
-        settings.SESSION_SECRET,
-        algorithms=["HS256"],
-        audience="kulajaj-admin",
-        issuer="kulajaj",
-    )
     get_store().set(
-        f"session:{assigned_claims['jti']}", first_record, ex=300
+        first_key,
+        json.dumps(
+            {
+                "user_id": 202,
+                "csrf": "forged",
+                "admin_version": admins.admin_version(202),
+            }
+        ),
+        ex=300,
     )
     with pytest.raises(PermissionError):
-        session.require_session(assigned)
+        session.require_session(first)
 
 
-def test_membership_dependency_failure_is_service_unavailable(client, monkeypatch):
+def test_assigned_admin_cannot_create_a_session(client, monkeypatch):
     _configure_admin(monkeypatch)
     admins.add_admin(202)
-    monkeypatch.setattr(
-        "app.auth.session.require_group_member", lambda *_args, **_kwargs: {"id": 202}
-    )
-    token, _csrf = session.issue_session(202)
-
-    def unavailable(*_args, **_kwargs):
-        raise RuntimeError("Telegram unavailable")
-
-    monkeypatch.setattr("app.auth.session.require_group_member", unavailable)
-    response = client.get(
-        "/api/admin/me",
-        headers={"Cookie": f"{session.SESSION_COOKIE}={token}"},
-    )
-    assert response.status_code == 503
+    with pytest.raises(PermissionError, match="owner"):
+        session.issue_session(202)
 
 
-def test_second_membership_check_failure_does_not_escape_as_server_error(
+def test_owner_session_does_not_depend_on_group_membership_checks(
     client, monkeypatch
 ):
     _configure_admin(monkeypatch)
-    admins.add_admin(202)
+    token, _csrf = session.issue_session(101)
     monkeypatch.setattr(
-        "app.auth.session.require_group_member", lambda *_args, **_kwargs: {"id": 202}
+        "app.auth.membership.require_group_member",
+        lambda *_args, **_kwargs: pytest.fail("membership must not be consulted"),
     )
-    token, _csrf = session.issue_session(202)
-    calls = 0
-
-    def fail_second(*_args, **_kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise RuntimeError("membership cache unavailable")
-        return {"id": 202}
-
-    monkeypatch.setattr("app.auth.session.require_group_member", fail_second)
     response = client.get(
         "/api/admin/me",
         headers={"Cookie": f"{session.SESSION_COOKIE}={token}"},
     )
-    assert response.status_code == 503
+    assert response.status_code == 200
+    assert response.json()["role"] == "super_admin"
 
 
 def test_logout_requires_origin_and_deletes_secure_host_cookie(client, monkeypatch):
@@ -841,7 +845,7 @@ def test_list_rename_preserves_members_atomically():
             "title": "After",
             "enabled": True,
             "priority": 2,
-            "applies_to": ["judge"],
+            "applies_to": ["explicit"],
             "injected_prompt": "New policy",
         },
     )
@@ -850,47 +854,36 @@ def test_list_rename_preserves_members_atomically():
     assert lists.member_ids("after") == [202]
 
 
-def test_tone_api_writes_all_requested_chat_fields(client, monkeypatch):
+def test_tone_api_writes_the_requested_chat_preset(client, monkeypatch):
     _configure_admin(monkeypatch)
     response = client.put(
         "/api/admin/tone",
         json={
             "scope": "chat",
-            "tone_mode": "custom",
             "tone_preset": "serious",
-            "custom_system_prompt": "Use this trusted prompt.",
-            "judge_default_n": 27,
         },
         headers=_admin_headers(101),
     )
     assert response.status_code == 200
-    assert response.json()["effective"]["judge_default_n"] == 27
-    assert response.json()["chat_override"]["custom_system_prompt"] == "Use this trusted prompt."
+    assert response.json()["effective"] == {"tone_preset": "serious"}
+    assert response.json()["chat_override"] == {"tone_preset": "serious"}
 
 
-def test_tone_api_partial_update_preserves_other_fields(client, monkeypatch):
+def test_tone_api_rejects_editable_system_prompt_fields(client, monkeypatch):
     _configure_admin(monkeypatch)
-    config_store.set_tone(
-        "chat",
-        chat_id=-100123,
-        tone_mode="custom",
-        tone_preset="serious",
-        custom_system_prompt="Saved chat prompt.",
-        judge_default_n=20,
-    )
 
     response = client.put(
         "/api/admin/tone",
-        json={"scope": "chat", "judge_default_n": 29},
+        json={
+            "scope": "chat",
+            "tone_preset": "serious",
+            "custom_system_prompt": "Replace immutable policy.",
+        },
         headers=_admin_headers(101),
     )
 
-    assert response.status_code == 200
-    override = response.json()["chat_override"]
-    assert override["tone_mode"] == "custom"
-    assert override["tone_preset"] == "serious"
-    assert override["custom_system_prompt"] == "Saved chat prompt."
-    assert override["judge_default_n"] == 29
+    assert response.status_code == 422
+    assert config_store.get_config(-100123)["chat_override"] is None
 
 
 def test_unknown_username_explains_observation_boundary(client, monkeypatch):
@@ -1029,10 +1022,18 @@ def test_group_membership_requires_active_status_and_verified_identity(monkeypat
         "app.auth.membership.telegram_client.get_chat_member",
         lambda _chat, user_id: {
             "status": "member",
-            "user": {"id": user_id, "first_name": "Member", "is_bot": False},
+            "user": {
+                "id": user_id,
+                "first_name": "Member",
+                "last_name": "MustNotBeStored",
+                "is_bot": False,
+            },
         },
     )
-    assert require_group_member(202)["id"] == 202
+    profile = require_group_member(202, seed_profile=True)
+    assert profile["id"] == 202
+    assert profile["name"] == "Member"
+    assert users.get(202)["name"] == "Member"
     get_store().delete("member:-100123:303")
     monkeypatch.setattr(
         "app.auth.membership.telegram_client.get_chat_member",
@@ -1042,41 +1043,11 @@ def test_group_membership_requires_active_status_and_verified_identity(monkeypat
         require_group_member(303)
 
 
-def test_tavily_query_guard_rejects_all_private_snapshot_terms():
-    from app.telegram.processor import _private_search_terms
-
-    request = {
-        "author": {"id": 10101, "username": "alice_private", "name": "Alice"},
-        "trigger": {
-            "text": "A long private trigger sentence with unique details",
-            "reply_to": {
-                "user_id": 20202,
-                "username": "bob_private",
-                "text": "A private replied sentence with unique details",
-            },
-        },
-        "reply_context": {
-            "user_id": 30303,
-            "name": "Carol Private",
-            "text": "Another private disputed sentence with unique details",
-        },
-        "context": [
-            {
-                "message_id": 40404,
-                "username": "dave_private",
-                "text": "Historical private context sentence with unique details",
-            }
-        ],
-    }
-    terms = _private_search_terms(request)
-
-    assert sanitize_query("alice_private public claim", terms) is None
-    assert sanitize_query("private trigger sentence", terms) is None
-    assert sanitize_query(
-        "buy gold", ("Please buy gold today before the meeting",)
-    ) is None
-    assert sanitize_query("40404 public claim", terms) is None
-    assert sanitize_query("generic public scientific fact", terms) is not None
+def test_explicit_google_query_is_normalized_and_bounded():
+    assert normalize_explicit_query("  alice_private   public claim  ") == (
+        "alice_private public claim"
+    )
+    assert normalize_explicit_query("x" * 241) == "x" * 240
 
 
 def test_seed_is_idempotent_without_force(monkeypatch):

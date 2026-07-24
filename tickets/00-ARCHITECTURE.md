@@ -14,13 +14,13 @@ people, with a web UI, dynamic LLM behaviour, and a recent-message buffer.
 | Hosting | Vercel Hobby, Python 3.12, one FastAPI application |
 | Telegram | Webhook; Privacy Mode disabled or the bot is a group admin. Ticket 05 requires bot group-admin status for reliable getChatMember use. |
 | Access boundary | Exactly one TELEGRAM_ALLOWED_CHAT_ID. Other groups and private chats receive 200 but are not logged or processed. |
-| Primary LLM | NVIDIA NIM deepseek-ai/deepseek-v4-flash |
-| Judge and explicit /deep | NVIDIA NIM deepseek-ai/deepseek-v4-pro |
-| LLM wrapper | langchain-nvidia-ai-endpoints==1.4.3, ChatNVIDIA, and the hosted-NIM non-thinking contract through with_thinking_mode(enabled=False) |
+| Primary LLM | One `LLM_MODEL` for every response; deployment default is NVIDIA NIM google/gemma-4-31b-it |
+| Thinking routes | Public /think, /google, and scheduled banter; all other routes are non-thinking |
+| LLM wrapper | langchain-nvidia-ai-endpoints==1.4.3 and asynchronous ChatNVIDIA with a request-shape contract for Gemma thinking on/off |
 | Queue | Upstash QStash. Webhook writes a Redis job/snapshot and publishes only an opaque job_id. |
 | Storage | Upstash Redis REST |
-| Fact search | Tavily basic search; no more than three de-identified queries per /judge |
-| Web auth | Telegram OIDC Authorization Code Flow with PKCE/state, then a short server-side session |
+| Fact search | One bounded Tavily basic search for each explicit /google request |
+| Web auth | Telegram OIDC Authorization Code Flow with PKCE/state, then a short owner-only server-side session |
 | Frontend | Static HTML/CSS/vanilla JavaScript in public/, no runtime build |
 
 Critical invariants:
@@ -33,12 +33,16 @@ Critical invariants:
    Successful outbound bot messages are history records too.
 4. Register Telegram with max_connections=1. For a routed update, snapshot up
    to 30 history records **before** upserting the trigger and before publishing.
-   The trigger is stored separately. Therefore /judge 30 can use 30 preceding
-   records and later messages cannot change the queued answer.
+   The trigger is stored separately, so later messages cannot change a queued
+   answer.
 5. Raw chat, names, and user instructions never enter a system role. They are
    untrusted user/data content.
 6. Send all LLM output as plain text and split it into chunks no longer than
    4,000 UTF-16 code units, leaving room below Telegram's 4,096-unit limit.
+7. Direct human responses are prefixed outside the model with the immutable
+   snapshot of the triggering Telegram account's current first_name.
+8. The checked-in super-context cannot be replaced by Redis or an admin API.
+   Dynamic tone/list/rule modifiers are explicitly subordinate to it.
 
 ~~~json
 {
@@ -60,7 +64,7 @@ Critical invariants:
 │   │   ├── webhook.py              # secret/chat gate, history, route, enqueue
 │   │   └── processor.py            # QStash callback, job machine, LLM, delivery
 │   ├── llm/
-│   │   └── client.py               # Flash and Pro ChatNVIDIA factories
+│   │   └── client.py               # One Gemma ChatNVIDIA factory
 │   ├── queue/
 │   │   └── qstash.py
 │   ├── search/
@@ -101,16 +105,17 @@ Critical invariants:
 | POST | /api/telegram/webhook | Telegram secret and allowed-chat gate, history/routing/enqueue | 01→03 |
 | POST | /api/telegram/process | Signed QStash callback with body containing job_id | 02 |
 | POST | /api/telegram/failure | Signed QStash failure callback and terminal/DLQ bookkeeping | 02 |
+| POST | /api/cron/banter | CRON_SECRET-authenticated twenty-minute scheduled banter enqueue | 08 |
 | GET | /api/public/config | Safe bot username and OIDC client ID only | 05 |
 | GET | /api/auth/telegram/start | Create OIDC state, nonce, PKCE, then redirect | 05 |
 | GET | /api/auth/telegram/callback | Validate callback and issue session | 05 |
 | POST | /api/auth/logout | Same-origin and CSRF protected logout | 05 |
 | GET | /api/admin/me | Current role and CSRF token | 05 |
-| CRUD | /api/admin/admins | Super-admin allowlist management | 05 |
+| CRUD | /api/admin/admins | Legacy assigned-role records; owner access only | 05→06 |
 | GET/DELETE | /api/admin/users | Observed-user lookup and deletion | 05 |
 | CRUD | /api/admin/lists | List metadata and membership | 05 |
 | CRUD | /api/admin/rules | Text rules | 05 |
-| GET/PUT/DELETE | /api/admin/tone | Tone, custom prompt, judge default, and chat override | 05 |
+| GET/PUT/DELETE | /api/admin/tone | Fixed-preset global/chat tone override | 05→06 |
 | GET/DELETE | /api/admin/logs | Allowed-chat history read or purge | 05 |
 
 ### Redis keys
@@ -118,16 +123,16 @@ Critical invariants:
 | Key | Type | Meaning |
 |---|---|---|
 | hist:<chat_id> | list, maximum 30 | JSON history records; atomic versioned upsert/prune by message_id and ts; newest first |
-| user:<user_id> | JSON string | id, username, name, is_bot, last_seen_at, last_update_id; profile and alias update atomically |
+| user:<user_id> | JSON string | id, username, bounded Telegram first_name in name, is_bot, last_seen_at, last_update_id; profile and alias update atomically |
 | username:<normalized> | string | Globally versioned current user_id; stale owners cannot reclaim an alias |
-| bot:self | bounded JSON cache | Verified getMe numeric ID and username |
+| bot:self | bounded JSON cache | Verified getMe numeric ID, username, and Telegram first_name |
 | dedup:update:<update_id> | string, 24h | Final receipt: history/users complete; routed work reached at least enqueued |
 | cmd:<update_id> | JSON string, 30d | Durable tone/mode command outcome, atomically paired with configuration mutation |
 | job:<update_id> | hash, absolute expires_at | State, attempts, immutable request JSON, timestamps, QStash/placeholder IDs, error |
 | jobs:chat:<chat_id> | zset job_id→expires_at | Job IDs for privacy purge; expired members are pruned by score |
 | jobs:user:<user_id> | zset job_id→expires_at | Job IDs that contain a user's data |
-| cfg:global | JSON string | Fallback tone_mode, tone_preset, custom_system_prompt, judge_default_n |
-| cfg:<chat_id> | JSON string | Chat override, only for the allowed chat |
+| cfg:global | JSON string | Fallback tone_preset |
+| cfg:<chat_id> | JSON string | Chat tone_preset override, only for the allowed chat |
 | admins | set | Numeric Telegram IDs; SUPER_ADMIN_ID is never removable |
 | adminver:<user_id> | integer | Role/session version, incremented on role change |
 | auth:state:<hash> | JSON string, 10m | One-time OIDC state, nonce, verifier, browser-binding hash, exact redirect URI |
@@ -142,6 +147,11 @@ Critical invariants:
 | rules:index | set | Rule IDs |
 | rule:<id> | JSON string | Deterministic rule |
 | cooldown:auto:<chat_id> | string, EX | Atomic auto-route blocker and owner token |
+| scheduled:slot:<chat_id>:<slot> | string, EX | Idempotency marker for one scheduled banter slot |
+| memory:epoch:<chat_id> | integer string | Mutable-memory generation boundary used by lobotomy |
+| memory:gathered<user_id> | JSON string | Bounded sender-scoped gathered shard: Telegram messages, fallible observations, and image OCR/description |
+| memory:gathered:tombstone:<chat_id>:<user_id> | integer string, ≤30d | Per-user privacy-deletion cutoff that rejects queued pre-deletion memory writes |
+| lobotomy:members:<chat_id> | set | Super-admin-invited active members allowed to run `/lobotomy` |
 
 ## 4. Canonical data model
 
@@ -153,7 +163,7 @@ Critical invariants:
   "source_update_id": 987,
   "user_id": 456,
   "username": "user",
-  "name": "Display name",
+  "name": "Telegram first_name",
   "text": "message text",
   "ts": 1780000000,
   "edit_ts": null,
@@ -167,6 +177,19 @@ Critical invariants:
   }
 }
 ~~~
+
+### Gathered-shard entry
+
+Runtime gathered memory is a bounded JSON list in the per-user Redis key above;
+it is not written to the ephemeral Vercel filesystem. Every eligible human
+message is keyed by the Telegram sender ID (without chat ID because this
+deployment has one configured chat) and records the current Telegram
+`first_name`, source message ID, timestamp, text, provenance, and confidence.
+Telegram photos and image documents additionally carry bounded media metadata.
+The worker may attach a short, fallible OCR/description result generated by the
+configured multimodal model. The file ID is used only for the ephemeral download
+and is never stored in the gathered entry. Edits replace the sender's prior
+message entry, and `/lobotomy` clears all gathered keys.
 
 - ts comes from Telegram message.date and edit_ts from edit_date. Server time is
   only diagnostic received_at job data.
@@ -199,7 +222,7 @@ rule.kind="personal".
   "title": "Sarcastic response",
   "enabled": true,
   "priority": 50,
-  "applies_to": ["explicit", "auto", "judge"],
+  "applies_to": ["explicit", "auto"],
   "injected_prompt": "Use dry sarcasm without personal attacks."
 }
 ~~~
@@ -222,14 +245,15 @@ collapse; do not alter the source text sent to the LLM.
 
 Rules sort by priority DESC, id ASC; lists sort by priority DESC, slug ASC.
 Process equal-priority rules as one group in id order. If any rule in that group
-has stop_processing=true, skip all lower-priority groups. A rule scope is auto,
-explicit, judge, or all. The reserved ignore list suppresses only auto replies;
-explicit mention/reply and admin commands remain available. Cooldown applies only
-to auto replies.
+has stop_processing=true, skip all lower-priority groups. A current rule scope
+is auto, explicit, or all. The reserved ignore list suppresses only auto
+replies; explicit mention/reply and public commands remain available. Cooldown
+applies only to auto replies. Legacy judge scopes remain readable until old
+records expire but are never selected by a current route.
 
 Canonical tone slugs are neutral, serious, scientist, street, and
-sarcastic_robot. The chat-command-only alias sarcastic maps to sarcastic_robot.
-API and Redis never store aliases.
+sarcastic_bot. The chat-command-only alias sarcastic and legacy stored
+sarcastic_robot both map to sarcastic_bot. API and Redis never write aliases.
 
 ## 5. Retry-safe job state machine
 
@@ -289,12 +313,12 @@ transitions without overwriting a newer state.
    a job with an active lease; after expiry, CAS marks failed, increments the
    fence, and deletes the lease.
 
-The immutable request snapshot includes the effective trusted policy computed at
-enqueue time, including the numeric actor ID and server-computed administrator
-role. Every user whose data appears in the trigger, reply target, context, or a
-nested reply is included in the job's user purge indexes. A saved QStash message
-ID plus any state after `received`, including `failed_retryable`, is proof that
-enqueue happened for final Telegram deduplication. Processing is limited to
+The immutable request snapshot includes the effective subordinate tone/list/rule
+policy computed at enqueue time. It never includes administrator status. Every
+user whose data appears in the trigger, reply target, context, or a nested reply
+is included in the job's user purge indexes. A saved QStash message ID plus any
+state after `received`, including `failed_retryable`, is proof that enqueue
+happened for final Telegram deduplication. Processing is limited to
 `Upstash-Retries + 1`, currently four acquired attempts.
 
 The placeholder is the only Telegram delivery allowed before the answer is
@@ -315,24 +339,25 @@ Checkpointed editMessageText may safely retry.
 
 Build a message sequence with explicit roles:
 
-1. System/base: active preset; a non-empty custom_system_prompt replaces it.
-2. System/actor policy: only server-verified numeric user_id and is_admin.
+1. System/base: the checked-in immutable super-context.
+2. System/tone: the bounded active preset, explicitly subordinate to the base.
 3. System/personal policy: administrator-authored list instructions in
    deterministic order.
 4. System/matched rules: administrator-authored rule instructions.
-5. System/judge policy: only for /judge; structure, impartiality, fact-check and
-   citation constraints.
+5. System/route policy: bounded built-in instructions for reply, /think,
+   /google, automatic rules, memory, or scheduled banter.
 6. User/untrusted data: JSON- or XML-like transcript, Telegram names/usernames,
    reply context, current text, and search results marked as data whose embedded
    instructions are not executable.
 
 Use at most one aggregate system message before user/data. Never concatenate raw
 chat into a system string. Bound built-in and admin-authored instruction lengths.
-The UI explains that custom prompts and rules are trusted administrator content.
+The UI exposes only bounded list/rule modifiers and fixed tone presets. It
+cannot replace or edit the immutable super-context.
 
 ~~~text
 build_reply_messages(job, effective_policy) -> messages
-build_judge_messages(job, effective_policy, evidence) -> messages
+build_google_messages(job, evidence) -> messages
 ~~~
 
 ## 7. Environment and dependencies
@@ -347,8 +372,7 @@ TELEGRAM_WEBHOOK_SECRET=replace_with_random_secret
 TELEGRAM_ALLOWED_CHAT_ID=-1000000000000
 
 NVIDIA_API_KEY=replace_me
-LLM_MODEL_FAST=deepseek-ai/deepseek-v4-flash
-LLM_MODEL_SMART=deepseek-ai/deepseek-v4-pro
+LLM_MODEL=google/gemma-4-31b-it
 
 UPSTASH_REDIS_REST_URL=https://replace-me.upstash.io
 UPSTASH_REDIS_REST_TOKEN=replace_me
@@ -358,7 +382,6 @@ QSTASH_CURRENT_SIGNING_KEY=replace_me
 QSTASH_NEXT_SIGNING_KEY=replace_me
 
 TAVILY_API_KEY=replace_me
-FACT_CHECK_MAX_QUERIES=3
 
 SUPER_ADMIN_ID=123456789
 SESSION_SECRET=replace_with_32_plus_random_bytes
@@ -376,11 +399,12 @@ AUTO_TRIGGER_COOLDOWN_SECONDS=30
 Pin direct dependencies including FastAPI, pydantic-settings, httpx,
 upstash-redis, qstash, langchain-nvidia-ai-endpoints==1.4.3, and PyJWT[crypto].
 
-Both Flash and Pro factories call with_thinking_mode(enabled=False). In the
-pinned wrapper it maps to chat_template_kwargs.thinking=false. A contract test
-captures the outgoing request. Do not send a literal root extra_body or an
-unverified root reasoning_effort. Enabling thinking requires a separate
-researched, live-verified change and an updated contract test.
+The single Gemma factory calls with_thinking_mode(enabled=False) for ordinary
+work and enabled=True only for /think and /google. In the pinned wrapper and
+current NVIDIA model profile this maps to
+chat_template_kwargs.enable_thinking=false/true. Contract tests capture both
+outgoing request shapes. Do not send a literal root extra_body or an unverified
+root reasoning_effort.
 
 ## 8. Privacy, operations, and quality
 
@@ -388,11 +412,12 @@ researched, live-verified change and an updated contract test.
   to 30 recent messages, excludes and removes records beyond the configured
   cutoff at the next access, lets the entire buffer expire after the same idle
   period, retains observed profiles/list membership until deletion, and retains
-  private job snapshots for seven days. It must identify the administrator and
+  durable model-job snapshots for seven days. It must identify the owner contact and
   purge path.
-- Selected context goes to NVIDIA. Tavily receives only de-identified factual
-  queries, never participant names, usernames, IDs, quotes, or raw transcript.
-  QStash receives only job_id.
+- Selected context goes to NVIDIA. Tavily is called only for `/google` and
+  receives the bounded query the participant explicitly supplied in that
+  command. It never receives recent group history automatically. QStash
+  receives only job_id.
 - The UI lets a super-admin purge history/jobs and delete an observed profile.
   It cancels non-terminal jobs, removes their snapshots/answers, and then clears
   history. Workers recheck cancellation before provider calls and delivery. A
@@ -408,10 +433,11 @@ researched, live-verified change and an updated contract test.
 
 ~~~text
 01 closed-chat ingestion, history, users
-  → 02 durable QStash jobs and Flash replies
+  → 02 durable QStash jobs and original replies
     → 03 deterministic rules, lists, tone, and auto routing
-      → 04 admin-only judge, Pro, and grounded fact check
+      → 04 historical judge workflow
         → 05 OIDC admin API/UI and privacy controls
+          → 06 immutable super-context, Gemma, and public commands
 ~~~
 
 The plan intentionally has few tickets. Each ends in automated checks and a live
@@ -419,7 +445,7 @@ Telegram/Vercel/Upstash end-to-end check.
 
 ## 10. Verified external contracts (2026-07-17)
 
-- NVIDIA hosted model pages: [DeepSeek V4 Flash](https://build.nvidia.com/deepseek-ai/deepseek-v4-flash) and [DeepSeek V4 Pro](https://build.nvidia.com/deepseek-ai/deepseek-v4-pro).
+- NVIDIA hosted model page: [Gemma 4 31B IT](https://build.nvidia.com/google/gemma-4-31b-it).
 - LangChain: [ChatNVIDIA.with_thinking_mode](https://reference.langchain.com/python/langchain-nvidia-ai-endpoints/chat_models/ChatNVIDIA/with_thinking_mode). The wrapper version remains pinned by a request-shape contract test.
 - Telegram: [Privacy Mode](https://core.telegram.org/bots/features#privacy-mode) and [OIDC Authorization Code + PKCE](https://core.telegram.org/bots/telegram-login).
 - Vercel: [Function limits](https://vercel.com/docs/functions/limitations). Hobby Python functions currently have a 300-second maximum.

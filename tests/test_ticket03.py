@@ -133,47 +133,29 @@ def test_corrupt_rule_index_is_retryable_instead_of_silently_ignored(client):
     assert store.get("dedup:update:906") is None
 
 
-def test_tone_config_merges_and_preserves_custom_prompt():
-    config_store.set_tone(
-        "global", tone_mode="custom", custom_system_prompt="Be concise.", judge_default_n=25
-    )
+def test_tone_config_merges_global_and_chat_presets():
+    config_store.set_tone("global", tone_preset="scientist")
     without_override = config_store.get_config(100)
     assert without_override["chat_override"] is None
-    assert without_override["effective"]["custom_system_prompt"] == "Be concise."
-    assert without_override["effective"]["judge_default_n"] == 25
-    config_store.set_tone("chat", chat_id=100, tone_mode="preset", tone_preset="serious")
+    assert without_override["effective"] == {"tone_preset": "scientist"}
+    config_store.set_tone("chat", chat_id=100, tone_preset="serious")
     config = config_store.get_config(100)
-    assert config["effective"]["tone_preset"] == "serious"
-    assert config["global"]["custom_system_prompt"] == "Be concise."
+    assert config["effective"] == {"tone_preset": "serious"}
+    assert config["global"] == {"tone_preset": "scientist"}
 
 
-def test_partial_tone_updates_preserve_unspecified_global_and_chat_fields():
-    config_store.set_tone(
-        "global",
-        tone_mode="custom",
-        tone_preset="serious",
-        custom_system_prompt="Global custom prompt.",
-        judge_default_n=25,
+def test_legacy_tone_fields_are_discarded_on_read():
+    get_store().set(
+        config_store.GLOBAL_CONFIG_KEY,
+        (
+            '{"tone_mode":"custom","tone_preset":"sarcastic_robot",'
+            '"custom_system_prompt":"replace core","judge_default_n":30}'
+        ),
     )
-    config_store.set_tone("global", judge_default_n=27)
-    global_config = config_store.get_config(100)["global"]
-    assert global_config == {
-        "tone_mode": "custom",
-        "tone_preset": "serious",
-        "custom_system_prompt": "Global custom prompt.",
-        "judge_default_n": 27,
+
+    assert config_store.get_config(100)["global"] == {
+        "tone_preset": "sarcastic_bot"
     }
-
-    config_store.set_tone(
-        "chat",
-        chat_id=100,
-        tone_mode="custom",
-        custom_system_prompt="Saved chat prompt.",
-    )
-    config_store.set_tone("chat", chat_id=100, tone_mode="preset")
-    chat_override = config_store.get_config(100)["chat_override"]
-    assert chat_override["tone_mode"] == "preset"
-    assert chat_override["custom_system_prompt"] == "Saved chat prompt."
 
 
 def test_ignore_list_only_blocks_automatic_membership():
@@ -278,29 +260,29 @@ def test_policy_entity_caps_are_enforced_atomically(monkeypatch):
         )
 
 
-def test_tone_commands_are_admin_only_idempotent_and_canonicalized(client, monkeypatch):
+def test_tone_commands_are_public_idempotent_and_canonicalized(client, monkeypatch):
     monkeypatch.setattr(settings, "SUPER_ADMIN_ID", 5)
-    first = post_webhook(client, make_update(update_id=910, text="/tone sarcastic"))
-    assert first.status_code == 200
-    assert "sarcastic_robot" in first.json()["text"]
-    assert config_store.get_config(100)["effective"]["tone_preset"] == "sarcastic_robot"
-
-    duplicate = post_webhook(client, make_update(update_id=910, text="/tone street"))
-    assert duplicate.json() == {"ok": True, "dedup": True}
-    assert config_store.get_config(100)["effective"]["tone_preset"] == "sarcastic_robot"
-
-    config_store.set_tone("global", judge_default_n=27)
-    assert config_store.get_config(100)["effective"]["judge_default_n"] == 27
-
-    config_store.set_tone("global", tone_mode="custom", custom_system_prompt="Keep me")
-    global_change = post_webhook(
-        client, make_update(update_id=912, text="/tone global street")
+    first = post_webhook(
+        client,
+        make_update(update_id=910, user_id=7, text="/tone sarcastic"),
     )
-    assert global_change.json()["text"].endswith("street.")
-    assert config_store.get_config(100)["global"]["custom_system_prompt"] == "Keep me"
+    assert first.status_code == 200
+    assert "sarcastic_bot" in first.json()["text"]
+    assert config_store.get_config(100)["effective"]["tone_preset"] == "sarcastic_bot"
 
-    refused = post_webhook(client, make_update(update_id=911, user_id=7, text="/tone serious"))
-    assert "administrator" in refused.json()["text"]
+    duplicate = post_webhook(
+        client,
+        make_update(update_id=910, user_id=7, text="/tone street"),
+    )
+    assert duplicate.json() == {"ok": True, "dedup": True}
+    assert config_store.get_config(100)["effective"]["tone_preset"] == "sarcastic_bot"
+
+    second_user = post_webhook(
+        client,
+        make_update(update_id=911, user_id=8, first_name="Bob", text="/tone serious"),
+    )
+    assert second_user.json()["text"] == "Bob, Tone set to serious."
+    assert config_store.get_config(100)["effective"]["tone_preset"] == "serious"
 
 
 def test_mode_configuration_failure_does_not_consume_command_receipt(
@@ -325,4 +307,4 @@ def test_mode_configuration_failure_does_not_consume_command_receipt(
 
     assert first.status_code == 503
     assert retry.status_code == 200
-    assert retry.json()["text"].startswith("Mode:")
+    assert retry.json()["text"].startswith("Alice, Mode:")

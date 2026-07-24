@@ -91,12 +91,12 @@ def test_ping(client):
     body = r.json()
     assert body["method"] == "sendMessage"
     assert body["chat_id"] == 100
-    assert body["text"] == "pong"
+    assert body["text"] == "Alice, pong"
 
 
 def test_ping_with_botname(client):
     r = post_webhook(client, make_update(update_id=11, text="/ping@test_bot"))
-    assert r.json()["text"] == "pong"
+    assert r.json()["text"] == "Alice, pong"
 
 
 def test_ping_addressed_to_another_bot_is_not_answered(client):
@@ -192,7 +192,7 @@ def test_concurrent_duplicate_commands_have_one_response_winner(client, monkeypa
         thread.join(timeout=5)
 
     assert all(not thread.is_alive() for thread in threads)
-    assert sum(body.get("text") == "pong" for body in responses) == 1
+    assert sum(body.get("text") == "Alice, pong" for body in responses) == 1
     assert responses.count({"ok": True, "dedup": True}) == 1
     assert len(history.recent(201)) == 1
 
@@ -331,6 +331,7 @@ def test_production_bot_can_ingest_without_optional_admin_oidc_secrets(
     monkeypatch.setattr(
         settings, "QSTASH_NEXT_SIGNING_KEY", "next-signing-key"
     )
+    monkeypatch.setattr(settings, "CRON_SECRET", "cron-secret")
     monkeypatch.setattr(settings, "SUPER_ADMIN_ID", None)
     monkeypatch.setattr(settings, "SESSION_SECRET", "")
     monkeypatch.setattr(settings, "TELEGRAM_OIDC_CLIENT_ID", "")

@@ -13,6 +13,7 @@ from typing import Literal
 from app.settings import Settings, settings
 from app.store.job_backend import JobBackend, MemoryJobBackend, utc_now
 from app.store.redis import get_store
+from app.telegram.job_contract import MAX_SAVED_ANSWER_CHARS
 
 JobState = Literal[
     "received",
@@ -44,7 +45,6 @@ _MAX_JOB_ID_CHARS = 32
 _MAX_MESSAGE_ID_CHARS = 512
 _MAX_INTENT_NAME_CHARS = 96
 _MAX_ERROR_CLASS_CHARS = 96
-_MAX_ANSWER_CHARS = 64_000
 FAILURE_NOTICE_TEXT = "Sorry, I could not complete that reply. Please try again later."
 FAILURE_NOTICE_HASH = hashlib.sha256(FAILURE_NOTICE_TEXT.encode()).hexdigest()
 
@@ -469,7 +469,14 @@ class JobRepository:
         now: int | None = None,
     ) -> IntentResult:
         _validate_intent_name(name)
-        if kind not in {"sendMessage", "editMessageText", "judgeStage"}:
+        # judgeStage remains readable only for safe takeover of pre-Ticket-06
+        # jobs that may still be inside the retention window.
+        if kind not in {
+            "sendMessage",
+            "editMessageText",
+            "externalSearch",
+            "judgeStage",
+        }:
             raise ValueError("intent kind is invalid")
         if isinstance(chunk_index, bool) or not isinstance(chunk_index, int):
             raise ValueError("chunk_index must be an integer")
@@ -541,7 +548,11 @@ class JobRepository:
     def save_answer(
         self, lease: JobLease, answer: str, *, now: int | None = None
     ) -> str:
-        if not isinstance(answer, str) or not answer or len(answer) > _MAX_ANSWER_CHARS:
+        if (
+            not isinstance(answer, str)
+            or not answer
+            or len(answer) > MAX_SAVED_ANSWER_CHARS
+        ):
             raise ValueError("answer is invalid")
         result = self._backend.save_answer(
             lease.job_id,
@@ -568,20 +579,30 @@ class JobRepository:
         *,
         error_class: str | None = None,
         failure_notice: bool = False,
+        failure_notice_text: str | None = None,
         now: int | None = None,
     ) -> None:
         if error_class is not None and (
             not error_class or len(error_class) > _MAX_ERROR_CLASS_CHARS
         ):
             raise ValueError("error_class is invalid")
+        notice_text = None
+        notice_hash = None
+        if failure_notice:
+            notice_text = failure_notice_text or FAILURE_NOTICE_TEXT
+            if not isinstance(notice_text, str) or not 1 <= len(notice_text) <= 4_000:
+                raise ValueError("failure_notice_text is invalid")
+            notice_hash = hashlib.sha256(notice_text.encode("utf-8")).hexdigest()
+        elif failure_notice_text is not None:
+            raise ValueError("failure_notice_text requires failure_notice")
         status = self._backend.finish_owned(
             lease.job_id,
             token=lease.token,
             fence=lease.fence,
             target_state=target_state,
             error_class=error_class,
-            failure_notice_hash=FAILURE_NOTICE_HASH if failure_notice else None,
-            failure_notice_text=FAILURE_NOTICE_TEXT if failure_notice else None,
+            failure_notice_hash=notice_hash,
+            failure_notice_text=notice_text,
             now=utc_now() if now is None else now,
         )
         if status == "ownership_lost":
@@ -602,18 +623,29 @@ class JobRepository:
         job_id: str | int,
         source_message_id: str,
         *,
+        failure_notice_text: str | None = FAILURE_NOTICE_TEXT,
         max_retries: int = 3,
         now: int | None = None,
     ) -> FailureTakeover:
         normalized_id = _job_id(job_id)
         if isinstance(max_retries, bool) or not isinstance(max_retries, int):
             raise ValueError("max_retries is invalid")
+        if failure_notice_text is not None and (
+            not isinstance(failure_notice_text, str)
+            or not 1 <= len(failure_notice_text) <= 4_000
+        ):
+            raise ValueError("failure_notice_text is invalid")
+        notice_hash = (
+            hashlib.sha256(failure_notice_text.encode("utf-8")).hexdigest()
+            if failure_notice_text is not None
+            else None
+        )
         current_time = utc_now() if now is None else now
         result = self._backend.failure_takeover(
             normalized_id,
             source_message_id=source_message_id,
-            failure_notice_hash=FAILURE_NOTICE_HASH,
-            failure_notice_text=FAILURE_NOTICE_TEXT,
+            failure_notice_hash=notice_hash,
+            failure_notice_text=failure_notice_text,
             max_retries=max_retries,
             now=current_time,
         )

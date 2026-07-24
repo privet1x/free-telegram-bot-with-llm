@@ -50,6 +50,26 @@ def test_upstash_failure_takeover_passes_callback_retry_policy():
     assert redis.calls[-1][2][-1] == "4"
 
 
+def test_upstash_failure_takeover_can_suppress_failure_notice():
+    redis = _RecordingRedis('{"status":"failed"}')
+    backend = _backend(redis)
+
+    result = backend.failure_takeover(
+        "job-1",
+        source_message_id="qstash-1",
+        failure_notice_hash=None,
+        failure_notice_text=None,
+        max_retries=3,
+        now=100,
+    )
+
+    assert result == {"status": "failed"}
+    script, _keys, args = redis.calls[-1]
+    assert args[2:4] == ["", ""]
+    assert "if ARGV[3] ~= '' and ARGV[4] ~= '' then" in script
+    assert "'failure_notice_state', notice_state" in script
+
+
 def test_upstash_privacy_purge_returns_snapshot_and_removes_all_indexes_atomically():
     redis = _RecordingRedis(
         ["state", "processing", "checkpoint:placeholder", '{"message_id":9001}']

@@ -10,7 +10,6 @@ from typing import Any
 import jwt
 
 from app.settings import session_secret_is_safe, settings
-from app.auth.membership import require_group_member
 from app.store import admins
 from app.store.redis import get_store
 
@@ -23,12 +22,15 @@ def _session_key(jti: str) -> str:
 
 
 def issue_session(user_id: int) -> tuple[str, str]:
-    if not admins.is_admin(user_id):
-        raise PermissionError("not an administrator")
+    if (
+        isinstance(user_id, bool)
+        or not isinstance(user_id, int)
+        or user_id <= 0
+        or user_id != settings.SUPER_ADMIN_ID
+    ):
+        raise PermissionError("owner access required")
     if not session_secret_is_safe(settings.SESSION_SECRET):
         raise PermissionError("session service unavailable")
-    if user_id != settings.SUPER_ADMIN_ID:
-        require_group_member(user_id, seed_profile=True, allow_cache=False)
     jti = secrets.token_urlsafe(24)
     now = int(time.time())
     token = jwt.encode(
@@ -92,14 +94,9 @@ def require_session(token: str | None) -> int:
         or claim_version != version
         or record.get("user_id") != user_id
         or record.get("admin_version") != version
-        or not admins.is_admin(user_id)
+        or user_id != settings.SUPER_ADMIN_ID
     ):
         raise PermissionError("unauthorized")
-    if user_id != settings.SUPER_ADMIN_ID:
-        try:
-            require_group_member(user_id, allow_cache=True)
-        except PermissionError:
-            raise PermissionError("unauthorized") from None
     return user_id
 
 

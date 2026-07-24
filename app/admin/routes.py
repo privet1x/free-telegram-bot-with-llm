@@ -21,9 +21,11 @@ from starlette.concurrency import run_in_threadpool
 from app.auth import session
 from app.auth.membership import require_group_member
 from app.auth.telegram_oidc import authorization_url, consume_state, create_state
+from app.memory import purge_user as purge_memory_user
+from app.memory.store import clear_gathered
 from app.request_body import InvalidRequestBody, RequestBodyTooLarge, read_bounded_body
 from app.settings import production_config_errors, session_secret_is_safe, settings
-from app.store import admins, config_store, history, lists, rules, users
+from app.store import admins, config_store, history, lists, lobotomy_access, rules, users
 from app.store.jobs import (
     chat_index_key,
     get_job_repository,
@@ -62,8 +64,8 @@ class ListInput(StrictModel):
     title: str = Field(min_length=1, max_length=256)
     enabled: bool
     priority: int = Field(ge=-1000, le=1000)
-    applies_to: list[Literal["explicit", "auto", "judge"]] = Field(
-        min_length=1, max_length=3
+    applies_to: list[Literal["explicit", "auto"]] = Field(
+        min_length=1, max_length=2
     )
     injected_prompt: str = Field(max_length=8_000)
 
@@ -83,7 +85,7 @@ class RuleInput(StrictModel):
     id: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9_-]*$")
     enabled: bool
     priority: int = Field(ge=-1000, le=1000)
-    scope: Literal["auto", "explicit", "judge", "all"]
+    scope: Literal["auto", "explicit", "all"]
     match: RuleMatchInput
     instruction: str = Field(min_length=1, max_length=8_000)
     stop_processing: bool
@@ -91,22 +93,9 @@ class RuleInput(StrictModel):
 
 class ToneInput(StrictModel):
     scope: Literal["global", "chat"]
-    tone_mode: Literal["preset", "custom"] | None = None
     tone_preset: Literal[
-        "neutral", "serious", "scientist", "street", "sarcastic_robot"
-    ] | None = None
-    custom_system_prompt: str | None = Field(default=None, max_length=8_000)
-    judge_default_n: int | None = Field(default=None, ge=5, le=30)
-
-    @model_validator(mode="after")
-    def contains_tone_update(self) -> "ToneInput":
-        update_fields = self.model_fields_set - {"scope"}
-        if not update_fields:
-            raise ValueError("provide at least one tone field")
-        for field in ("tone_mode", "tone_preset", "judge_default_n"):
-            if field in update_fields and getattr(self, field) is None:
-                raise ValueError(f"{field} cannot be null")
-        return self
+        "neutral", "serious", "scientist", "street", "sarcastic_bot"
+    ]
 
 
 class PurgeInput(StrictModel):
@@ -529,6 +518,10 @@ def user_delete(request: Request, user_id: int, purge_messages: bool = False):
                     purge_result.outbound_message_ids,
                 )
             get_store().delete(privacy_receipt_key(index_key))
+        if settings.TELEGRAM_ALLOWED_CHAT_ID is not None:
+            purge_memory_user(settings.TELEGRAM_ALLOWED_CHAT_ID, user_id)
+            # Privacy/profile deletion also revokes any explicit /lobotomy access.
+            lobotomy_access.revoke(settings.TELEGRAM_ALLOWED_CHAT_ID, user_id)
         removed_profile, removed_memberships = users.delete_with_memberships(user_id)
     except ValueError:
         return _error("deletion failed", 422)
@@ -748,6 +741,7 @@ async def logs_delete(request: Request):
     index_key = chat_index_key(chat_id)
     purge_result = repository.purge_index(index_key)
     history.purge_all(chat_id)
+    clear_gathered(chat_id)
     get_store().delete(privacy_receipt_key(index_key))
     return {
         "purged": True,

@@ -8,6 +8,7 @@ import time
 from app.settings import settings
 from app.store import users
 from app.store.redis import get_store
+from app.telegram.addressing import normalize_first_name
 from app.telegram import client as telegram_client
 
 MEMBERSHIP_CACHE_SECONDS = 300
@@ -31,17 +32,14 @@ def _profile(member: dict, expected_user_id: int) -> dict[str, object]:
     if status not in ACTIVE_STATUSES or member_id != expected_user_id:
         raise PermissionError("user is not an active member of the allowed group")
     first = user.get("first_name") if isinstance(user, dict) else None
-    last = user.get("last_name") if isinstance(user, dict) else None
-    name = " ".join(
-        part.strip()
-        for part in (first, last)
-        if isinstance(part, str) and part.strip()
-    )
+    name = normalize_first_name(first)
+    if not name:
+        raise RuntimeError("Telegram membership response is invalid")
     username = user.get("username") if isinstance(user, dict) else None
     return {
         "id": expected_user_id,
         "username": username if isinstance(username, str) else None,
-        "name": name or str(username or expected_user_id),
+        "name": name,
         "is_bot": bool(user.get("is_bot", False)) if isinstance(user, dict) else False,
     }
 

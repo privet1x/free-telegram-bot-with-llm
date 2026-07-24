@@ -138,8 +138,8 @@ class JobBackend(Protocol):
         job_id: str,
         *,
         source_message_id: str,
-        failure_notice_hash: str,
-        failure_notice_text: str,
+        failure_notice_hash: str | None,
+        failure_notice_text: str | None,
         max_retries: int,
         now: int,
     ) -> dict[str, object]: ...
@@ -602,6 +602,10 @@ class MemoryJobBackend:
                     job["failure_notice_state"] = (
                         "pending" if job.get("placeholder_message_id") else "none"
                     )
+                elif target_state == "failed":
+                    job.pop("failure_notice_hash", None)
+                    job.pop("failure_notice_text", None)
+                    job["failure_notice_state"] = "none"
             else:
                 self._leases.pop(job_id, None)
             return "finished"
@@ -620,8 +624,8 @@ class MemoryJobBackend:
         job_id: str,
         *,
         source_message_id: str,
-        failure_notice_hash: str,
-        failure_notice_text: str,
+        failure_notice_hash: str | None,
+        failure_notice_text: str | None,
         max_retries: int,
         now: int,
     ) -> dict[str, object]:
@@ -647,11 +651,16 @@ class MemoryJobBackend:
             job["state"] = "failed"
             job["error_class"] = "qstash_retries_exhausted"
             job["updated_at"] = str(now)
-            job["failure_notice_hash"] = failure_notice_hash
-            job["failure_notice_text"] = failure_notice_text
-            job["failure_notice_state"] = (
-                "pending" if job.get("placeholder_message_id") else "none"
-            )
+            if failure_notice_hash and failure_notice_text:
+                job["failure_notice_hash"] = failure_notice_hash
+                job["failure_notice_text"] = failure_notice_text
+                job["failure_notice_state"] = (
+                    "pending" if job.get("placeholder_message_id") else "none"
+                )
+            else:
+                job.pop("failure_notice_hash", None)
+                job.pop("failure_notice_text", None)
+                job["failure_notice_state"] = "none"
             self._leases.pop(job_id, None)
             return {"status": "failed", "fence": fence}
 

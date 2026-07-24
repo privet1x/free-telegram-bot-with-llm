@@ -2,9 +2,9 @@
 
 This is an operator and manual acceptance-test guide for the Telegram group bot in this repository. Follow it in order for the first deployment. The later sections can be reused as a release checklist.
 
-The bot is intentionally scoped to one Telegram group. It records that group's conversation history, answers explicit requests with the fast model, can automatically react through rules, and gives administrators deeper dispute analysis with the smart model and optional web research. The web admin panel manages administrators, user policies, rules, tone, logs, and privacy deletion.
+The bot is intentionally scoped to one Telegram group. It records that group's conversation history, answers mentions and replies with one configured NVIDIA model, can automatically react through rules, and provides public `/think` and `/google` commands. The owner-only web panel manages user policies, rules, tone, logs, and privacy deletion.
 
-> **Privacy and cost warning:** use a private test group first. Tell every participant that the bot stores messages and may send selected content to NVIDIA-hosted models and, during fact-checking, deidentified search queries to Tavily. Do not test with private or sensitive conversations.
+> **Privacy and cost warning:** use a private test group first. Tell every participant that the bot stores messages and may send selected content to NVIDIA-hosted models. When a participant explicitly uses `/google`, its bounded query is sent to Tavily; recent group history is not sent to Tavily. Do not test with private or sensitive conversations.
 
 > **Configuration assumption for this project:** the existing local `.env` is already populated and must be preserved. The only unset entry is the commented `PUBLIC_BASE_URL=https://<project>.vercel.app` placeholder, because the real origin is not known until Vercel assigns it. Do not copy `.env.example` over `.env`, regenerate secrets, create replacement provider credentials, or commit `.env`.
 
@@ -17,7 +17,7 @@ You already have the required credentials. Make sure you can sign in to their ex
 - [Upstash Redis](https://upstash.com/docs/redis/overall/getstarted)
 - [Upstash QStash](https://upstash.com/docs/qstash/overall/getstarted)
 - [NVIDIA API Catalog](https://build.nvidia.com/)
-- [Tavily](https://docs.tavily.com/documentation/quickstart) for web-assisted judge results
+- [Tavily](https://docs.tavily.com/documentation/quickstart) for `/google`
 
 On your computer, install:
 
@@ -53,8 +53,7 @@ Telegram's [privacy-mode documentation](https://core.telegram.org/bots/features#
 
 1. Create a private Telegram group specifically for testing.
 2. Add the bot to it.
-3. Promote it to administrator. It does not need broad moderation rights, but administrator status makes group-member checks reliable for admin-panel authorization.
-4. Add at least one second human tester. Judge testing requires messages from at least two human authors.
+3. Add at least one second human tester so public-command and identity behavior can be checked with different accounts.
 
 The application accepts only `TELEGRAM_ALLOWED_CHAT_ID`; events from every other group are ignored and not stored.
 
@@ -126,17 +125,17 @@ QStash moves slow LLM work out of the Telegram webhook. Its console's **Logs** v
 ### 3.3 NVIDIA models
 
 1. Sign in to the existing account at [build.nvidia.com](https://build.nvidia.com/).
-2. Confirm the existing `NVIDIA_API_KEY` can access the model IDs configured in `LLM_MODEL_FAST` and `LLM_MODEL_SMART`.
-3. The checked-in values (`deepseek-ai/deepseek-v4-flash` and `deepseek-ai/deepseek-v4-pro`) are defaults. You may choose other NVIDIA-supported model IDs; keep both variables non-empty and verify provider access before testing.
+2. Confirm the existing `NVIDIA_API_KEY` can access the model configured in `LLM_MODEL`.
+3. Use `LLM_MODEL=google/gemma-4-31b-it` for this deployment. The code deliberately checks only that the one model value is non-empty, so changing it later does not require a code change.
 
-The Flash model handles ordinary explicit and automatic replies. The Pro model handles `/deep` and judge workflows.
+The same model handles every generated response. Thinking is disabled for normal and automatic replies, and enabled only for `/think` and `/google`.
 
 ### 3.4 Tavily
 
 1. Open the existing Tavily project.
 2. Confirm the already-configured `TAVILY_API_KEY` is active.
 
-Tavily is optional for application startup, but required to test web-assisted fact checking. Without it, judge still runs in logic-only mode and explicitly warns that web verification was unavailable.
+Tavily is optional for application startup, but required for live `/google` search. Without it, `/google` explicitly reports that live search was unavailable and does not fabricate source URLs.
 
 ## 4. Run locally and run the automated tests
 
@@ -263,8 +262,7 @@ The following tables are an audit inventory, not instructions to generate new va
 | `TELEGRAM_ALLOWED_CHAT_ID` | Keep existing negative numeric group ID |
 | `ALLOW_UNFILTERED_LOCAL_CHATS` | `false` |
 | `NVIDIA_API_KEY` | Keep existing `.env` value |
-| `LLM_MODEL_FAST` | Existing NVIDIA-supported fast model ID |
-| `LLM_MODEL_SMART` | Existing NVIDIA-supported smart model ID |
+| `LLM_MODEL` | `google/gemma-4-31b-it` |
 | `UPSTASH_REDIS_REST_URL` | Keep existing `.env` value |
 | `UPSTASH_REDIS_REST_TOKEN` | Keep existing `.env` value |
 | `QSTASH_URL` | Keep existing `.env` value |
@@ -282,19 +280,18 @@ The following tables are an audit inventory, not instructions to generate new va
 | `TELEGRAM_OIDC_CLIENT_ID` | Keep existing `.env` value |
 | `TELEGRAM_OIDC_CLIENT_SECRET` | Keep existing `.env` secret |
 
-### Required for complete judge testing
+### Required for complete `/google` testing
 
 | Variable | Value |
 |---|---|
 | `TAVILY_API_KEY` | Keep existing `.env` value |
-| `FACT_CHECK_MAX_QUERIES` | Keep existing value; initial default is `3` |
 
 Keep the existing retention, worker, lease, cooldown, and policy-limit values. The table shows the expected initial values for comparison. In particular, the worker budget must remain below the function duration and the job lease must remain safely above the worker budget.
 
 | Variable | Initial value | Meaning |
 |---|---:|---|
 | `HISTORY_RETENTION_SECONDS` | `2592000` | Retain the bounded history for up to 30 days |
-| `JOB_RETENTION_SECONDS` | `604800` | Retain private job snapshots for up to 7 days |
+| `JOB_RETENTION_SECONDS` | `604800` | Retain durable model-job snapshots for up to 7 days |
 | `WORKER_BUDGET_SECONDS` | `240` | Maximum application work budget per job |
 | `JOB_LEASE_SECONDS` | `270` | Worker ownership lease; safely above the worker budget |
 | `AUTO_TRIGGER_COOLDOWN_SECONDS` | `30` | Per-chat automatic-reply cooldown |
@@ -351,9 +348,9 @@ Do not use `--drop-pending` unless you intentionally want Telegram to discard un
 ### Normal chat behavior
 
 - An ordinary message is stored but gets no reply unless an enabled automatic rule matches.
-- An exact `@your_bot_username` mention asks the Flash model to answer.
-- Replying to a message authored by the bot also asks the Flash model to answer.
-- The bot first sends `Thinking…`, then edits that placeholder with the result.
+- An exact `@your_bot_username` mention asks the configured model to answer.
+- Replying to a message authored by the bot also asks the configured model to answer.
+- The bot first sends `<your Telegram first_name>, Thinking…`, then edits that placeholder with an answer carrying the same verified first-name prefix.
 - Long answers are split into Telegram-safe chunks.
 - Editing a message updates stored history but never starts a second bot job.
 - Commands explicitly addressed to another bot, such as `/ping@OtherBot`, are ignored.
@@ -362,48 +359,35 @@ Do not use `--drop-pending` unless you intentionally want Telegram to discard un
 
 | Command | Who can use it | Behavior |
 |---|---|---|
-| `/ping` | Anyone in the allowed group | Returns `pong` |
+| `/ping` | Anyone in the allowed group | Returns `<first_name>, pong` |
 | `/help` | Anyone | Shows the basic in-chat usage help |
-| `/mode` | Administrator | Shows effective tone/mode and available presets |
-| `/tone <preset>` | Administrator | Sets this group's tone preset |
-| `/tone global <preset>` | Administrator | Sets the global tone preset |
-| `/tone clear` | Administrator | Clears the group override and falls back to global |
-| `/set_mode <preset>` | Administrator | Alias for tone selection |
-| `/judge [N]` | Administrator | Analyzes the latest `N` eligible messages as a dispute |
-| `/dispute [N]` | Administrator | Alias for `/judge` |
-| `/deep <question>` | Administrator | Uses the Pro model for a deeper contextual answer |
+| `/mode` | Anyone | Shows the active chat tone and available presets |
+| `/tone <preset>` | Anyone | Sets this group's tone preset without clearing history |
+| `/think <question>` | Anyone | Uses recent context and enables private model thinking |
+| `/google <query>` | Anyone | Runs one bounded Tavily search and answers with validated sources |
 
-Available tone presets are `neutral`, `serious`, `scientist`, `street`, and `sarcastic_robot`. The short alias `sarcastic` maps to `sarcastic_robot`.
+Available tone presets are `neutral`, `serious`, `scientist`, `street`, and `sarcastic_bot`. The short aliases `sarcastic` and legacy `sarcastic_robot` map to `sarcastic_bot`.
 
-`/judge` defaults to the configured judge window. A supplied ASCII number is clamped to 5–30. It needs at least three meaningful prior messages from at least two human authors. A direct bot mention containing “judge us” or “who is right” also enters the judge workflow. Service commands are excluded from the transcript.
+`/set_mode`, `/deep`, `/judge`, and `/dispute` are removed. They return the same addressed unknown-command hint as any unsupported slash command and never start model work.
 
-Judge extracts checkable claims, performs up to the configured number of Tavily searches, and appends sources with `[Sx]` citations when web evidence is available. If Tavily is missing or a claim cannot be researched safely, it continues in logic-only mode and says so.
+`/google` sends only the query deliberately entered after the command to Tavily. It does not include recent chat history. The answer cites validated `[Sx]` identifiers and code-rendered HTTPS source URLs when search succeeds.
 
 ### Lists and rules
 
-- A **list** is a reusable trusted instruction attached to selected users. It can apply to explicit replies, automatic replies, judge, or a combination of these scopes.
+- A **list** is a reusable subordinate instruction attached to selected users. It can apply to explicit replies, automatic replies, or both.
 - At most the configured number of enabled list policies applies to one request. Higher-priority policies are injected first; equal priority is ordered by slug.
 - The reserved `ignore` list suppresses automatic reactions for its members. It does not block their exact mentions, replies, or commands.
-- A **rule** matches text by substring, word, or phrase. Its scope can be `explicit`, `auto`, `judge`, or `all`.
+- A **rule** matches text by substring, word, or phrase. Its scope can be `explicit`, `auto`, or `all`.
 - Rules in `auto` or `all` scope can make the bot answer an ordinary unmentioned message.
 - Automatic replies observe the configured per-chat cooldown, 30 seconds by default. Explicit requests still work during cooldown.
 - Higher-priority rules are applied first. A stopping rule prevents lower-priority groups from being applied.
-- Judge rules match the selected conversation transcript, not the `/judge` command text itself.
+- Neither lists nor rules can replace the checked-in immutable super-context.
 
 ## 10. Configure the admin panel
 
 Open the production origin in a normal browser and select **Log in with Telegram**. The account whose ID equals `SUPER_ADMIN_ID` becomes the super administrator. Sessions last at most eight hours.
 
-### Admins
-
-Only the super administrator can add or revoke other administrators.
-
-1. Open **Admins**.
-2. Add a user by exact numeric ID, or by username after the bot has observed at least one message from that user.
-3. The candidate must still be an active member of the configured group.
-4. Ask the new administrator to log in with their own Telegram account.
-
-Assigned administrators can manage normal configuration but cannot grant administrators or use super-admin-only privacy deletion. Revocation invalidates their active admin session.
+Only the Telegram account whose numeric ID equals `SUPER_ADMIN_ID` can create or reuse a panel session. There is no assigned-admin login flow. Other participants still have access to every in-chat command.
 
 ### Lists
 
@@ -427,7 +411,7 @@ Use distinctive nonsense test words so normal conversation cannot trigger paid r
 
 ### Tone
 
-The **Tone** page controls global defaults and the allowed group's override. It also shows the effective result. Presets control response style; custom mode requires a non-empty custom prompt. Judge window size must remain between 5 and 30. Clear the group override to inherit global settings again.
+The **Tone** page controls the fixed global preset and the allowed group's fixed-preset override. It shows the effective result. The panel cannot edit the immutable super-context or supply a custom system prompt. Clear the group override to inherit the global preset again.
 
 ### Logs
 
@@ -453,7 +437,7 @@ Record pass/fail and screenshots in a separate test note. Watch Vercel function 
 - [ ] Health reports the durable Upstash store.
 - [ ] Health reports Tavily enabled for the full test configuration.
 - [ ] `scripts/set_webhook.py info` shows the correct production URL and no recent error.
-- [ ] `/ping` returns `pong` in the allowed group.
+- [ ] `/ping` returns `<your first_name>, pong` in the allowed group.
 - [ ] `/help` returns usage text.
 - [ ] A plain message without a matching auto rule produces no response.
 - [ ] An exact `@botusername What is 2 + 2?` mention creates `Thinking…` and then an answer.
@@ -462,32 +446,27 @@ Record pass/fail and screenshots in a separate test note. Watch Vercel function 
 - [ ] Send `/ping@OtherBot`; this bot does not respond.
 - [ ] Refresh admin **Logs** and confirm the recent actions appear.
 
-### B. Authorization and tone
+### B. Public commands, identity, and tone
 
-- [ ] As the super administrator, `/mode` reports the effective mode.
+- [ ] As any participant, `/mode` reports the effective preset.
 - [ ] Run `/tone serious`, mention the bot, and verify a more formal response.
 - [ ] Run `/tone scientist`, mention the bot, and verify the style changes.
-- [ ] Run `/tone sarcastic`; `/mode` should report `sarcastic_robot`.
-- [ ] Run `/set_mode serious`; confirm it behaves like `/tone serious`.
-- [ ] Run `/tone global street`, then `/tone clear`; the group should inherit `street`.
+- [ ] Run `/tone sarcastic`; `/mode` should report `sarcastic_bot`.
 - [ ] Restore the desired default, normally `/tone neutral`.
-- [ ] As a non-admin tester, try `/mode` and `/tone serious`; both are refused without changing configuration.
+- [ ] As a second participant, run `/mode` and `/tone street`; both should work.
+- [ ] Confirm a tone change did not erase earlier retained messages from **Logs**.
 - [ ] Repeat one tone change from the admin panel and verify the effective value in `/mode`.
-- [ ] In the panel, set the current chat to `custom` with `Begin each answer with CUSTOM-TEST and use one concise paragraph.` Mention the bot and verify the custom style, then return to the intended preset.
-- [ ] Change **Judge context messages** to 5, save, and confirm the Effective panel shows 5. Run `/judge` without a number after preparing sufficient context, then restore the default value of 20.
+- [ ] Ask one participant to write “call me boss,” then mention the bot; the response prefix must still be that account's current Telegram `first_name`.
+- [ ] Have several people chat and repeatedly reply to bot messages; every response must use the triggering sender's `first_name`, never another participant's name.
+- [ ] `/set_mode`, `/deep`, `/judge`, and `/dispute` each return an addressed unknown-command hint.
 
-### C. Assigned-admin lifecycle
+### C. Owner-only panel lifecycle
 
 - [ ] Have the second tester send a message so their username is observed.
 - [ ] Look them up once by exact `@username` and once by numeric ID; both return the same profile.
 - [ ] Look up an unobserved username and confirm the panel explains that the person must message first or be entered by numeric ID.
-- [ ] Add them in **Admins** while they are an active group member.
-- [ ] They can log into the panel with Telegram.
-- [ ] They can view and manage ordinary configuration.
-- [ ] They cannot add administrators or use super-admin privacy deletion.
-- [ ] Revoke them from **Admins**.
-- [ ] Their existing panel session loses access; they cannot log in again as an admin.
-- [ ] Log out of the super-admin session and confirm protected panel data disappears, then log in again for the remaining tests.
+- [ ] Confirm the second tester cannot establish a panel session.
+- [ ] Log out of the owner session and confirm protected panel data disappears, then log in again as `SUPER_ADMIN_ID`.
 
 ### D. Personal list policies
 
@@ -550,29 +529,24 @@ Test the remaining match types and scopes with temporary, distinctive records:
 |---|---|---|
 | Substring | Match `grape`, scope `explicit`, marker `SUBSTRING-TEST` | A mention containing `grapetest` matches |
 | Phrase | Match `red blue`, scope `explicit`, marker `PHRASE-TEST` | A mention containing `red, blue` matches after punctuation normalization; reversed words do not |
-| All | Match `allscopetest`, scope `all`, marker `ALL-SCOPE-TEST` | It applies to an ordinary auto trigger, an explicit mention, and judge when the selected transcript contains the match |
-| Judge | Match `orbitest`, scope `judge`, marker `JUDGE-RULE-TEST` | It does not trigger an ordinary reply but influences judge when `orbitest` is in the selected transcript |
+| All | Match `allscopetest`, scope `all`, marker `ALL-SCOPE-TEST` | It applies to an ordinary auto trigger and an explicit mention |
 
 - [ ] Create two explicit rules for the same word at different priorities. Put `stop_processing` on the higher-priority rule; verify the lower-priority instruction is excluded.
 - [ ] Edit a rule and confirm its ID cannot be changed.
-- [ ] Delete all temporary rules after the judge tests to prevent accidental requests and cost.
+- [ ] Delete all temporary rules after the tests to prevent accidental requests and cost.
 
-### F. Judge and deep analysis
+### F. Thinking and live web search
 
-Have two humans exchange at least three meaningful messages. Include one safe, publicly checkable disagreement, for example the opening year of a landmark. Do not use personal claims.
+Have two humans exchange several messages, then use a safe, publicly checkable question such as the opening year of a landmark.
 
-- [ ] As an administrator, run `/judge 5`.
-- [ ] `Thinking…` is replaced by a Pro-model dispute analysis.
-- [ ] The response identifies the participants without leaking internal numeric IDs.
-- [ ] Checkable claims have `[Sx]` citations and a source list when Tavily evidence exists.
-- [ ] The conclusion distinguishes sourced facts from reasoning or uncertainty.
-- [ ] Run `/dispute 5` and confirm equivalent routing.
-- [ ] Mention the bot with “judge us” and confirm judge routing.
-- [ ] A non-admin `/judge 5` is refused before expensive model work starts.
-- [ ] Run `/deep Explain the strongest argument on each side`; confirm a contextual Pro-model answer.
-- [ ] Run judge when fewer than the required meaningful/two-author messages exist after the final purge; it should explain that context is insufficient.
+- [ ] Any participant runs `/think Explain the strongest argument on each side`.
+- [ ] The addressed `Thinking…` placeholder is replaced by a contextual answer; no private reasoning trace appears.
+- [ ] Any participant runs `/google In what year did the Eiffel Tower open?`.
+- [ ] The answer has valid `[Sx]` citations and a code-rendered HTTPS source list when Tavily returns evidence.
+- [ ] Ask `/google` a query containing a distinctive harmless token; confirm only that explicit query, not recent group history, appears in the Tavily request if you inspect provider logs.
+- [ ] Confirm ordinary mentions remain non-thinking and are not automatically sent to Tavily.
 
-Optional degraded-mode test: remove `TAVILY_API_KEY` from a disposable deployment and redeploy. Health should report Tavily disabled, while judge should complete with a clear logic-only warning and no fabricated web citations. Restore the key and redeploy afterward.
+Optional degraded-mode test: remove `TAVILY_API_KEY` from a disposable deployment and redeploy. Health should report Tavily disabled, while `/google` should disclose unavailable live search and must not fabricate source URLs. Restore the key and redeploy afterward.
 
 ### G. Persistence, formatting, and safety
 
@@ -585,14 +559,17 @@ Optional degraded-mode test: remove `TAVILY_API_KEY` from a disposable deploymen
 
 ### H. Privacy deletion — destructive, do last
 
-1. Copy the privacy notice from the panel and publish it in the test group.
+1. Enter a monitored owner contact (a working Telegram `@username` or another
+   monitored channel) on the panel's **Privacy** page. The copy button remains
+   disabled until this is present. Copy the generated notice and publish it in
+   the test group.
 2. Choose a test participant, not the super administrator.
-3. Delete their profile without purging messages. Confirm their observed profile, list memberships, and any admin grant disappear, while retained chat messages remain.
+3. Delete their profile without purging messages. Confirm their observed profile and list memberships disappear, while retained chat messages remain.
 4. Have them speak again; verify they are observed again.
 5. Delete them with message/job purge enabled. Confirm authored messages and stored reply quotations are scrubbed and their queued work is removed.
 6. Enter the exact full-purge confirmation phrase shown by the panel.
 7. Confirm logs/history and indexed jobs for the group are empty.
-8. Immediately run `/judge 5`; it should report insufficient history.
+8. Mention the bot after the purge and confirm no pre-purge conversation is present in its answer context.
 
 Do not perform the full purge against a group whose retained history you need.
 
@@ -606,7 +583,53 @@ python scripts/seed.py
 
 It is idempotent. `--force` overwrites demo records, so use that option only intentionally. The application can run without seeding, but the protected `ignore` list will not be available for membership management. For a clean real setup, seed once, retain `ignore`, and delete the two demo records in the panel. Create all other policies manually.
 
-## 13. Troubleshooting
+## 13. Memory, keyword reactions, and scheduled banter
+
+Before deploying these features, fill `app/memory/manifest.json` with the fixed
+participants' numeric Telegram IDs and add the matching read-only
+`app/memory/shards/memory-shard-<slug>.md` files. Names and usernames are never
+used as shard keys. Runtime gathered shards are durable per-user JSON documents
+in Upstash Redis under `memory:gathered<user_id>`, not writable files in the
+Vercel bundle. Set a random
+`CRON_SECRET` in Vercel; Vercel Cron invokes `/api/cron/banter` every 20 minutes
+automatically.
+
+Manual checks in the allowed group:
+
+1. Send a normal message, then mention or reply to the bot. The answer must use
+   the sender's current Telegram `first_name`, while the relevant static shard
+   and fallible gathered observations may influence the content only.
+2. Run `/lobotomy` as a normal non-invited participant. The bot must refuse it.
+   Run `/lobotomy` as `SUPER_ADMIN_ID` while that account is an active member of
+   the allowed group; it must clear recent context and gathered observations.
+   Run `/invite @username` as the super-admin for another active group member,
+   then verify that member can run `/lobotomy`. Run `/uninvite @username` and
+   verify that the same user is refused again; this changes only the bot's
+   access roster, not Telegram group membership. A user who is removed or no
+   longer an active Telegram member must be refused again. The super-admin has
+   no cooldown; static shards, tone, lists, and rules remain available.
+3. Send messages containing `бред`, `босс`, `кик`, `кикни`, including approved
+   inflections and punctuation. Each message must produce one short negative
+   joke, even during the ordinary automatic-rule cooldown and during quiet hours.
+   Bot-authored messages and false-positive substrings must not trigger it.
+4. Reply to a scheduled banter message. It must be saved in history and behave
+   like an ordinary bot message when someone replies to it.
+   Scheduled banter uses thinking mode and still calls the model when the
+   available human context is empty; only the final message is delivered.
+5. Confirm no scheduled message is sent from 01:00 through 08:59 Warsaw time;
+   the first eligible slot at 09:00 uses up to 30 human messages and does not
+   count bot messages toward that limit.
+6. Send a photo with a short caption while mentioning the bot (or reply to the
+   bot with a photo). Confirm the answer reflects visible image content. The
+   sender's gathered shard should eventually contain the Telegram message ID,
+   current first name, caption, and bounded OCR/description. A captionless photo
+   is also stored and analyzed through a background QStash job, but it does not
+   create a chat reply by itself.
+7. Send a photo larger than the configured safe limit or a non-image document.
+   Confirm the bot fails safely without exposing file data or creating an
+   unbounded memory entry.
+
+## 14. Troubleshooting
 
 ### Health returns 503
 
@@ -614,7 +637,7 @@ Read the named configuration fields in the JSON response, correct them in Vercel
 
 ### Bot sees commands but not ordinary messages
 
-Privacy mode is probably still enabled. Disable it in BotFather, remove and re-add the bot, and keep it as group administrator. Run `scripts/check_telegram.py` again.
+Privacy mode is probably still enabled. Disable it in BotFather, remove and re-add the bot, then run `scripts/check_telegram.py` again.
 
 ### Bot responds nowhere
 
@@ -640,7 +663,7 @@ Confirm all of these match exactly:
 - BotFather callback ending in `/api/auth/telegram/callback`
 - Vercel OIDC client ID and secret
 
-Keep OIDC at RS256. Also verify that the Telegram account is the configured super administrator or an assigned administrator still in the group. The bot should be group administrator for reliable membership checks.
+Keep OIDC at RS256. Also verify that the Telegram account's numeric ID exactly equals `SUPER_ADMIN_ID`; assigned administrators cannot log in.
 
 ### Username cannot be found in the panel
 
@@ -650,9 +673,9 @@ Ask that user to send a message in the allowed group, refresh, and try the exact
 
 Check that it is enabled, has `auto` or `all` scope, uses the intended match type, and matches the exact text. Then check the sender's `ignore` membership and wait past the cooldown. Editing an existing message is intentionally non-triggering.
 
-### Judge has no citations
+### `/google` has no citations
 
-Confirm Tavily is enabled in health and its key is valid. Some claims are subjective, private, unsafe to search, or unsupported; those should not receive invented citations. Review Vercel logs for provider timeout information.
+Confirm Tavily is enabled in health and its key is valid. Search can still return no usable evidence; the bot should disclose that and must not invent citations. Review Vercel logs for provider timeout information.
 
 ### A setup script says polling conflicts with a webhook
 
@@ -671,7 +694,6 @@ After manual testing:
 - Delete temporary rules and lists.
 - Remove test members from `ignore`.
 - Clear test chat tone overrides and restore the intended global preset.
-- Revoke temporary administrators.
 - Use privacy deletion/full purge only if the test history should be erased.
 - Rotate any secret that appeared in a terminal recording, screenshot, or shared message, then update Vercel and redeploy.
 
@@ -696,10 +718,10 @@ A release is ready for real participants only when all of these are true:
 - Production health returns 200 with durable Upstash storage.
 - Redis, QStash, and Telegram check scripts pass.
 - Webhook info has the correct stable URL and no delivery error.
-- Mention, reply, automatic rule, `/deep`, and `/judge` each complete successfully.
-- Admin login, assignment, revocation, lists, rules, tone, logs, and privacy controls were manually checked.
+- Mention, reply, automatic rule, `/think`, and `/google` each complete successfully.
+- Owner login, lists, rules, tone, logs, and privacy controls were manually checked.
 - The bot ignores non-allowed groups.
 - The participant privacy notice has been published.
-- Temporary test rules, policies, users, and admin grants have been cleaned up.
+- Temporary test rules, policies, and users have been cleaned up.
 
-At that point, add real participants to the one configured group, explain the mention/reply and admin-only commands, and monitor Vercel and QStash logs during the first live session.
+At that point, add real participants to the one configured group, explain mention/reply and the public commands, and monitor Vercel and QStash logs during the first live session.

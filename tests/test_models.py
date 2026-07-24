@@ -47,12 +47,12 @@ def test_parse_reply_to_bot():
     assert msg.reply_to_text == "earlier bot answer"
 
 
-def test_parse_name_fallbacks():
+def test_parse_name_never_falls_back_to_username():
     upd = make_update()
     upd["message"]["from"] = {"id": 9, "is_bot": False, "username": "onlyuser"}
     msg = parse_update(upd)
     assert msg is not None
-    assert msg.name == "onlyuser"
+    assert msg.name == "unknown"
 
 
 def test_parse_returns_none_without_message():
@@ -393,6 +393,7 @@ def test_outbound_history_record_normalizes_successful_bot_message():
             "id": 999,
             "is_bot": True,
             "first_name": "Test",
+            "last_name": "Wrong Last Name",
             "username": "test_bot",
         },
         "text": "Thinking…",
@@ -408,6 +409,7 @@ def test_outbound_history_record_normalizes_successful_bot_message():
     assert record["message_id"] == 77
     assert record["source_update_id"] == 123
     assert record["user_id"] == 999
+    assert record["name"] == "Test"
     assert record["text"] == "Thinking…"
     assert record["is_bot"] is True
 

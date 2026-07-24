@@ -471,6 +471,14 @@ if terminal_states[target] then
         local notice_state = 'none'
         if placeholder and placeholder ~= '' then notice_state = 'pending' end
         redis.call('HSET', KEYS[1], 'failure_notice_state', notice_state)
+    elseif target == 'failed' then
+        redis.call(
+            'HDEL',
+            KEYS[1],
+            'failure_notice_hash',
+            'failure_notice_text'
+        )
+        redis.call('HSET', KEYS[1], 'failure_notice_state', 'none')
     end
 end
 redis.call('DEL', KEYS[2])
@@ -526,18 +534,31 @@ end
 local fence = integer(redis.call('HGET', KEYS[1], 'fence'), 0) + 1
 local placeholder = redis.call('HGET', KEYS[1], 'placeholder_message_id')
 local notice_state = 'none'
-if placeholder and placeholder ~= '' then notice_state = 'pending' end
 redis.call(
     'HSET',
     KEYS[1],
     'fence', tostring(fence),
     'state', 'failed',
     'error_class', 'qstash_retries_exhausted',
-    'updated_at', tostring(now),
-    'failure_notice_hash', ARGV[3],
-    'failure_notice_text', ARGV[4],
-    'failure_notice_state', notice_state
+    'updated_at', tostring(now)
 )
+if ARGV[3] ~= '' and ARGV[4] ~= '' then
+    if placeholder and placeholder ~= '' then notice_state = 'pending' end
+    redis.call(
+        'HSET',
+        KEYS[1],
+        'failure_notice_hash', ARGV[3],
+        'failure_notice_text', ARGV[4]
+    )
+else
+    redis.call(
+        'HDEL',
+        KEYS[1],
+        'failure_notice_hash',
+        'failure_notice_text'
+    )
+end
+redis.call('HSET', KEYS[1], 'failure_notice_state', notice_state)
 redis.call('DEL', KEYS[2])
 return cjson.encode({status = 'failed', fence = fence})
 """
@@ -1041,8 +1062,8 @@ class UpstashJobBackend:
         job_id: str,
         *,
         source_message_id: str,
-        failure_notice_hash: str,
-        failure_notice_text: str,
+        failure_notice_hash: str | None,
+        failure_notice_text: str | None,
         max_retries: int,
         now: int,
     ) -> dict[str, object]:
@@ -1053,8 +1074,8 @@ class UpstashJobBackend:
                 [
                     str(now),
                     source_message_id,
-                    failure_notice_hash,
-                    failure_notice_text,
+                    failure_notice_hash or "",
+                    failure_notice_text or "",
                     str(max_retries),
                 ],
             )

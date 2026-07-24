@@ -36,14 +36,12 @@ class Settings(BaseSettings):
     # normal local operation continue to require the single allowed chat ID.
     ALLOW_UNFILTERED_LOCAL_CHATS: bool = False
 
-    # NVIDIA NIM (used from ticket 02 onwards)
+    # NVIDIA NIM
     NVIDIA_API_KEY: str = ""
-    LLM_MODEL_FAST: str = "deepseek-ai/deepseek-v4-flash"
-    LLM_MODEL_SMART: str = "deepseek-ai/deepseek-v4-pro"
+    LLM_MODEL: str = "google/gemma-4-31b-it"
 
-    # Grounded fact checks for /judge (ticket 04)
+    # Explicit live web search for /google
     TAVILY_API_KEY: str = ""
-    FACT_CHECK_MAX_QUERIES: int = Field(default=3, ge=1, le=3)
 
     # Upstash Redis
     UPSTASH_REDIS_REST_URL: str = ""
@@ -72,6 +70,8 @@ class Settings(BaseSettings):
 
     # General
     PUBLIC_BASE_URL: str = ""
+    # Vercel Cron authentication for scheduled banter.
+    CRON_SECRET: str = ""
 
     @field_validator(
         "JOB_RETENTION_SECONDS",
@@ -163,11 +163,11 @@ def production_bot_config_errors(config: Settings = settings) -> list[str]:
     errors = production_webhook_config_errors(config)
     required = {
         "NVIDIA_API_KEY": config.NVIDIA_API_KEY,
-        "LLM_MODEL_FAST": config.LLM_MODEL_FAST,
-        "LLM_MODEL_SMART": config.LLM_MODEL_SMART,
+        "LLM_MODEL": config.LLM_MODEL,
         "QSTASH_TOKEN": config.QSTASH_TOKEN,
         "QSTASH_CURRENT_SIGNING_KEY": config.QSTASH_CURRENT_SIGNING_KEY,
         "QSTASH_NEXT_SIGNING_KEY": config.QSTASH_NEXT_SIGNING_KEY,
+        "CRON_SECRET": config.CRON_SECRET,
     }
     errors.extend(
         name

@@ -13,6 +13,11 @@ import pytest
 from app.llm.client import LLMPermanentError, LLMRetryableError
 from app.queue.qstash import PUBLISH_RETRIES, failure_url, process_url
 from app.search.tavily import SearchSource
+from app.search.tavily import (
+    MAX_RESULTS as MAX_GOOGLE_SOURCES,
+    MAX_SOURCE_TITLE_CHARS,
+    MAX_SOURCE_URL_CHARS,
+)
 from app.settings import settings
 from app.store import history
 from app.store import jobs as jobs_module
@@ -25,11 +30,22 @@ from app.store.jobs import (
 from app.telegram import processor
 from app.telegram.client import TelegramAPIError
 from app.telegram.identity import BotIdentity
+from app.telegram.job_contract import (
+    JOB_SNAPSHOT_VERSION,
+    MAX_GENERATED_RESPONSE_CHARS,
+    MAX_SAVED_ANSWER_CHARS,
+)
 
 
 CURRENT_KEY = "current-signing-key-with-at-least-32-bytes"
 NEXT_KEY = "next-signing-key-with-at-least-32-bytes"
-BOT_IDENTITY = BotIdentity(id=999, username="test_bot")
+BOT_IDENTITY = BotIdentity(
+    id=999,
+    username="test_bot",
+    first_name="Test Bot",
+)
+ADDRESSED_PLACEHOLDER = "Alice, Thinking…"
+ADDRESSED_FAILURE_NOTICE = f"Alice, {FAILURE_NOTICE_TEXT}"
 
 
 def _now() -> int:
@@ -38,7 +54,9 @@ def _now() -> int:
 
 @pytest.fixture(autouse=True)
 def processor_configuration(fresh_store: None, monkeypatch: pytest.MonkeyPatch) -> None:
-    async def unexpected_generate(_: list[object]) -> str:
+    async def unexpected_generate(
+        _: list[object], *, thinking: bool = False
+    ) -> str:
         pytest.fail("a test must explicitly install its LLM fake")
 
     def unexpected_telegram(*_: object, **__: object) -> dict[str, object]:
@@ -50,7 +68,7 @@ def processor_configuration(fresh_store: None, monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(settings, "WORKER_BUDGET_SECONDS", 240)
     monkeypatch.setattr(settings, "JOB_LEASE_SECONDS", 270)
     monkeypatch.setattr(processor, "get_bot_identity", lambda: BOT_IDENTITY)
-    monkeypatch.setattr(processor, "generate_flash", unexpected_generate)
+    monkeypatch.setattr(processor, "generate", unexpected_generate)
     monkeypatch.setattr(processor.telegram_client, "send_message", unexpected_telegram)
     monkeypatch.setattr(
         processor.telegram_client, "edit_message_text", unexpected_telegram
@@ -145,7 +163,7 @@ def _request(job_id: int, *, chat_id: int = 100) -> dict[str, object]:
         "reply_to": None,
     }
     return {
-        "version": 1,
+        "version": JOB_SNAPSHOT_VERSION,
         "kind": "reply",
         "route": "mention",
         "chat_id": chat_id,
@@ -172,8 +190,7 @@ def _create_job(
     job = repo.create_reply_job(
         _request(job_id),
         {
-            "base_system_prompt": "Trusted test policy",
-            "actor": {"user_id": 5, "is_admin": False},
+            "tone_preset": "neutral",
             "list_policies": [],
             "rule_policies": [],
         },
@@ -189,30 +206,24 @@ def _create_job(
     return job
 
 
-def _create_judge_job(
+def _create_google_job(
     job_id: int,
     *,
     repository: JobRepository | None = None,
 ):
     repo = repository or get_job_repository()
     request = _request(job_id)
-    request["kind"] = "judge"
-    request["reply_context"] = {
-        "message_id": job_id + 999,
-        "user_id": 6,
-        "username": "bob_private",
-        "name": "Bob Private",
-        "text": "The disputed private statement",
-    }
+    request["kind"] = "google"
+    request["query"] = "current public fact"
+    request["context"] = []
     repo.create_reply_job(
         request,
         {
-            "base_system_prompt": "Trusted test policy",
-            "actor": {"user_id": 5, "is_admin": False},
+            "tone_preset": "neutral",
             "list_policies": [],
             "rule_policies": [],
         },
-        [5, 6],
+        [5],
     )
     return repo.record_publication(job_id, f"qstash-{job_id}")
 
@@ -267,7 +278,7 @@ class FakeTelegram:
     ) -> dict[str, object]:
         self.send_calls.append((chat_id, text, reply_to_message_id))
         self.events.append(f"send:{text[:16]}")
-        if text != processor.PLACEHOLDER_TEXT and self.before_answer_delivery:
+        if not text.endswith(processor.PLACEHOLDER_TEXT) and self.before_answer_delivery:
             self.before_answer_delivery(text)
         if self.send_errors:
             raise self.send_errors.pop(0)
@@ -312,7 +323,9 @@ def _install_answer(
 ) -> list[list[object]]:
     calls: list[list[object]] = []
 
-    async def generate(messages: list[object]) -> str:
+    async def generate(
+        messages: list[object], *, thinking: bool = False
+    ) -> str:
         calls.append(messages)
         if events is not None:
             events.append("flash")
@@ -320,7 +333,7 @@ def _install_answer(
             raise answer
         return answer
 
-    monkeypatch.setattr(processor, "generate_flash", generate)
+    monkeypatch.setattr(processor, "generate", generate)
     return calls
 
 
@@ -401,21 +414,26 @@ def test_complete_worker_journey_saves_answer_delivers_and_upserts_history(
 
     assert response.status_code == 200
     assert response.json() == {"ok": True}
-    assert events == ["send:Thinking…", "flash", "edit:A grounded answe"]
+    assert events == [
+        "send:Alice, Thinking…",
+        "flash",
+        "edit:Alice, A grounde",
+    ]
     assert len(llm_calls) == 1
-    assert telegram.send_calls == [(100, processor.PLACEHOLDER_TEXT, 1_301)]
-    assert telegram.edit_calls == [(100, 5_000, "A grounded answer.")]
+    assert telegram.send_calls == [(100, ADDRESSED_PLACEHOLDER, 1_301)]
+    assert telegram.edit_calls == [(100, 5_000, "Alice, A grounded answer.")]
     job = repository.get(301)
     assert job is not None
     assert job.state == "delivered"
-    assert job.answer_text == "A grounded answer."
+    assert job.answer_text == "Alice, A grounded answer."
     assert job.attempts == 1
     assert job.checkpoint("placeholder") is not None
     assert job.checkpoint("answer_edit") is not None
     records = history.recent(100)
     assert [(record["message_id"], record["text"]) for record in records] == [
-        (5_000, "A grounded answer.")
+        (5_000, "Alice, A grounded answer.")
     ]
+    assert records[0]["name"] == "Test Bot"
 
 
 def test_retry_reuses_saved_answer_placeholder_and_safe_edit_intent(
@@ -439,7 +457,7 @@ def test_retry_reuses_saved_answer_placeholder_and_safe_edit_intent(
     assert first.status_code == 503
     assert after_first is not None
     assert after_first.state == "failed_retryable"
-    assert after_first.answer_text == "Saved before delivery"
+    assert after_first.answer_text == "Alice, Saved before delivery"
     assert after_first.checkpoint("placeholder") is not None
     assert after_first.checkpoint("answer_edit") is None
 
@@ -483,11 +501,14 @@ def test_long_answer_is_saved_then_delivered_in_order_without_duplicate_retry(
     repository = get_job_repository()
     _create_job(303, repository=repository)
     answer = "a" * 4_000 + "b" * 4_000 + "c" * 501
+    addressed_answer = f"Alice, {answer}"
+    chunks = processor.telegram_client.split_plain_text(addressed_answer)
     telegram = FakeTelegram()
     telegram.before_answer_delivery = lambda _text: (
         (
             repository.get(303) is not None
-            and repository.get(303).answer_text == answer  # type: ignore[union-attr]
+            and repository.get(303).answer_text
+            == addressed_answer  # type: ignore[union-attr]
         )
         or pytest.fail("answer must be durable before answer delivery")
     )
@@ -499,18 +520,18 @@ def test_long_answer_is_saved_then_delivered_in_order_without_duplicate_retry(
 
     assert first.status_code == 200
     assert completed is not None and completed.state == "delivered"
-    assert telegram.edit_calls == [(100, 5_000, "a" * 4_000)]
+    assert telegram.edit_calls == [(100, 5_000, chunks[0])]
     assert [call[1] for call in telegram.send_calls] == [
-        processor.PLACEHOLDER_TEXT,
-        "b" * 4_000,
-        "c" * 501,
+        ADDRESSED_PLACEHOLDER,
+        *chunks[1:],
     ]
-    assert [call[2] for call in telegram.send_calls] == [1_303, None, None]
-    assert [record["text"] for record in reversed(history.recent(100))] == [
-        "a" * 4_000,
-        "b" * 4_000,
-        "c" * 501,
+    assert [call[2] for call in telegram.send_calls] == [
+        1_303,
+        *([None] * (len(chunks) - 1)),
     ]
+    assert [
+        record["text"] for record in reversed(history.recent(100))
+    ] == chunks
 
     duplicate = _post_process(client, 303)
     assert duplicate.status_code == 200
@@ -519,11 +540,35 @@ def test_long_answer_is_saved_then_delivered_in_order_without_duplicate_retry(
     assert len(telegram.edit_calls) == 1
 
 
+def test_maximum_generated_answer_still_fits_after_addressing(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = get_job_repository()
+    _create_job(30301, repository=repository)
+    telegram = FakeTelegram()
+    _install_telegram(monkeypatch, telegram)
+    _install_answer(monkeypatch, "x" * MAX_GENERATED_RESPONSE_CHARS)
+
+    response = _post_process(client, 30301)
+
+    delivered = repository.get(30301)
+    assert response.status_code == 200
+    assert delivered is not None and delivered.state == "delivered"
+    assert delivered.answer_text is not None
+    assert delivered.answer_text.startswith("Alice, ")
+    assert len(delivered.answer_text) == MAX_GENERATED_RESPONSE_CHARS + len(
+        "Alice, "
+    )
+
+
 def test_crash_after_later_chunk_send_intent_becomes_ambiguous_without_resend(
     client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repository = get_job_repository()
     _create_job(303_1, repository=repository)
+    chunks = processor.telegram_client.split_plain_text(
+        "Alice, " + "a" * 4_000 + "b"
+    )
     telegram = FakeTelegram()
     _install_telegram(monkeypatch, telegram)
     _install_answer(monkeypatch, "a" * 4_000 + "b")
@@ -549,8 +594,8 @@ def test_crash_after_later_chunk_send_intent_becomes_ambiguous_without_resend(
     job = repository.get(303_1)
     assert job is not None and job.state == "failed_ambiguous"
     assert [text for _, text, _ in telegram.send_calls] == [
-        processor.PLACEHOLDER_TEXT,
-        "b",
+        ADDRESSED_PLACEHOLDER,
+        chunks[1],
     ]
 
 
@@ -578,7 +623,9 @@ def test_history_write_failure_reuses_the_checkpoint_without_a_duplicate_send(
 
     assert first.status_code == 503
     assert retry.status_code == 200
-    assert [text for _, text, _ in telegram.send_calls] == [processor.PLACEHOLDER_TEXT]
+    assert [text for _, text, _ in telegram.send_calls] == [
+        ADDRESSED_PLACEHOLDER
+    ]
     assert len(telegram.edit_calls) == 1
 
 
@@ -610,7 +657,9 @@ def test_terminal_finish_failure_retries_checkpoints_without_duplicate_delivery(
 
     assert first.status_code == 503
     assert retry.status_code == 200
-    assert [text for _, text, _ in telegram.send_calls] == [processor.PLACEHOLDER_TEXT]
+    assert [text for _, text, _ in telegram.send_calls] == [
+        ADDRESSED_PLACEHOLDER
+    ]
     assert len(telegram.edit_calls) == 1
 
 
@@ -739,448 +788,295 @@ def test_retryable_provider_failure_is_sanitized_and_requeued(
     assert telegram.edit_calls == []
 
 
-def test_judge_claim_retry_clears_intent_and_resumes_without_ambiguity(
+def test_google_reuses_search_checkpoint_and_enables_thinking_on_llm_retry(
     client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repository = get_job_repository()
-    _create_judge_job(306_1, repository=repository)
+    _create_google_job(306_1, repository=repository)
     telegram = FakeTelegram()
     _install_telegram(monkeypatch, telegram)
+    search_calls: list[tuple[str, bool]] = []
+    generation_modes: list[bool] = []
     responses: list[str | BaseException] = [
         LLMRetryableError("provider_rate_limited"),
-        json.dumps(
-            {
-                "claims": [
-                    {
-                        "claim_id": "C1",
-                        "neutral_claim": "A public fact",
-                        "search_query": "public fact verification",
-                    }
-                ]
-            }
-        ),
-        "Logic-only verdict.",
+        "Grounded answer [S1].",
     ]
 
-    async def generate(_messages: list[object]) -> str:
-        value = responses.pop(0)
-        if isinstance(value, BaseException):
-            raise value
-        return value
-
-    monkeypatch.setattr(processor, "generate_pro", generate)
-    first = _post_process(client, 306_1)
-    assert first.status_code == 503
-    failed = repository.get(306_1)
-    assert failed is not None and failed.state == "failed_retryable"
-    assert failed.intent("judge_claims") is None
-
-    retry = _post_process(client, 306_1)
-    assert retry.status_code == 200
-    delivered = repository.get(306_1)
-    assert delivered is not None and delivered.state == "delivered"
-    assert len(telegram.send_calls) == 1
-    assert len(telegram.edit_calls) == 1
-
-
-def test_malformed_judge_claim_output_is_terminal_not_silent_logic_fallback(
-    client, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    repository = get_job_repository()
-    _create_judge_job(306_8, repository=repository)
-    telegram = FakeTelegram()
-    _install_telegram(monkeypatch, telegram)
-
-    async def generate(_messages: list[object]) -> str:
-        return 'Claims follow: {"claims": []}'
-
-    monkeypatch.setattr(processor, "generate_pro", generate)
-    response = _post_process(client, 306_8)
-
-    assert response.status_code == 200
-    failed = repository.get(306_8)
-    assert failed is not None and failed.state == "failed"
-    assert failed.error_class == "judge_claims_invalid"
-    assert failed.answer_text is None
-    assert telegram.edit_calls == [(100, 5_000, FAILURE_NOTICE_TEXT)]
-
-
-def test_judge_verdict_retry_reuses_claims_and_search_checkpoints(
-    client, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    repository = get_job_repository()
-    _create_judge_job(306_2, repository=repository)
-    telegram = FakeTelegram()
-    _install_telegram(monkeypatch, telegram)
-    calls: list[list[object]] = []
-    responses: list[str | BaseException] = [
-        json.dumps(
-            {
-                "claims": [
-                    {
-                        "claim_id": "C1",
-                        "neutral_claim": "A public fact",
-                        "search_query": "public fact verification",
-                    }
-                ]
-            }
-        ),
-        LLMRetryableError("provider_rate_limited"),
-        "Recovered verdict.",
-    ]
-
-    async def generate(messages: list[object]) -> str:
-        calls.append(messages)
-        value = responses.pop(0)
-        if isinstance(value, BaseException):
-            raise value
-        return value
-
-    monkeypatch.setattr(processor, "generate_pro", generate)
-    first = _post_process(client, 306_2)
-    assert first.status_code == 503
-    failed = repository.get(306_2)
-    assert failed is not None
-    assert failed.checkpoint("judge_claims") is not None
-    assert failed.checkpoint("judge_search:0") is not None
-    assert failed.intent("judge_verdict") is None
-
-    retry = _post_process(client, 306_2)
-    assert retry.status_code == 200
-    delivered = repository.get(306_2)
-    assert delivered is not None and delivered.state == "delivered"
-    assert len(calls) == 3
-    assert len(telegram.send_calls) == 1
-    assert len(telegram.edit_calls) == 1
-
-
-def test_judge_retry_reuses_each_completed_search_checkpoint(
-    client, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    repository = get_job_repository()
-    _create_judge_job(306_4, repository=repository)
-    telegram = FakeTelegram()
-    _install_telegram(monkeypatch, telegram)
-    responses: list[str | BaseException] = [
-        json.dumps(
-            {
-                "claims": [
-                    {
-                        "claim_id": "C1",
-                        "neutral_claim": "First public fact",
-                        "search_query": "first public fact verification",
-                    },
-                    {
-                        "claim_id": "C2",
-                        "neutral_claim": "Second public fact",
-                        "search_query": "second public fact verification",
-                    },
-                ]
-            }
-        ),
-        LLMRetryableError("provider_rate_limited"),
-        "Recovered verdict [S1] [S2] [S3] [S4].",
-    ]
-    final_source_ids: list[str] = []
-
-    async def generate(messages: list[object]) -> str:
-        value = responses.pop(0)
-        if isinstance(value, BaseException):
-            raise value
-        if value.startswith("Recovered verdict"):
-            payload = json.loads(str(messages[1].content))
-            final_source_ids.extend(
-                item["source_id"]
-                for item in payload["evidence"]
-                if "source_id" in item
-            )
-        return value
-
-    search_queries: list[str] = []
-
-    async def search(query: str, **_kwargs: object) -> list[SearchSource]:
-        search_queries.append(query)
-        claim_number = len(search_queries)
+    async def search(
+        query: str, *, explicit: bool = False, **_kwargs: object
+    ) -> list[SearchSource]:
+        search_calls.append((query, explicit))
         return [
             SearchSource(
-                source_id=f"provider-{claim_number}-{source_number}",
-                title=f"Source {claim_number}-{source_number}",
-                url=f"https://example.test/{claim_number}/{source_number}",
-                snippet="Public evidence.",
-            )
-            for source_number in (1, 2)
-        ]
-
-    monkeypatch.setattr(processor, "generate_pro", generate)
-    monkeypatch.setattr(processor, "tavily_search", search)
-
-    assert _post_process(client, 306_4).status_code == 503
-    assert _post_process(client, 306_4).status_code == 200
-    assert search_queries == [
-        "first public fact verification",
-        "second public fact verification",
-    ]
-    assert final_source_ids == ["S1", "S2", "S3", "S4"]
-
-
-def test_judge_search_checks_lease_ownership_before_provider_call(
-    client, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    repository = get_job_repository()
-    _create_judge_job(306_5, repository=repository)
-    telegram = FakeTelegram()
-    _install_telegram(monkeypatch, telegram)
-
-    async def generate(_messages: list[object]) -> str:
-        return json.dumps(
-            {
-                "claims": [
-                    {
-                        "claim_id": "C1",
-                        "neutral_claim": "A public fact",
-                        "search_query": "public fact verification",
-                    }
-                ]
-            }
-        )
-
-    search_queries: list[str] = []
-
-    async def search(query: str, **_kwargs: object) -> list[SearchSource]:
-        search_queries.append(query)
-        return []
-
-    real_prepare = repository.prepare_intent
-
-    def lose_ownership_before_search(lease: JobLease, **kwargs: object):
-        result = real_prepare(lease, **kwargs)
-        if kwargs.get("name") == "judge_search:0":
-            assert repository.release(lease) is True
-        return result
-
-    monkeypatch.setattr(processor, "generate_pro", generate)
-    monkeypatch.setattr(processor, "tavily_search", search)
-    monkeypatch.setattr(repository, "prepare_intent", lose_ownership_before_search)
-
-    assert _post_process(client, 306_5).status_code == 503
-    assert search_queries == []
-
-
-def test_private_judge_query_is_disclosed_without_calling_tavily(
-    client, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    repository = get_job_repository()
-    _create_judge_job(306_6, repository=repository)
-    telegram = FakeTelegram()
-    _install_telegram(monkeypatch, telegram)
-    responses = [
-        json.dumps(
-            {
-                "claims": [
-                    {
-                        "claim_id": "C1",
-                        "neutral_claim": "A participant made a factual claim.",
-                        "search_query": "The disputed private statement",
-                    }
-                ]
-            }
-        ),
-        "Logic-only verdict.",
-    ]
-
-    async def generate(_messages: list[object]) -> str:
-        return responses.pop(0)
-
-    async def unexpected_search(*_args: object, **_kwargs: object):
-        pytest.fail("private query data must never be sent to Tavily")
-
-    monkeypatch.setattr(processor, "generate_pro", generate)
-    monkeypatch.setattr(processor, "tavily_search", unexpected_search)
-
-    response = _post_process(client, 306_6)
-
-    assert response.status_code == 200
-    delivered = repository.get(306_6)
-    assert delivered is not None and delivered.state == "delivered"
-    assert "C1 — unverified_private" in (delivered.answer_text or "")
-
-
-def test_partial_judge_evidence_keeps_claim_links_and_discloses_unverified_claims(
-    client, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    repository = get_job_repository()
-    _create_judge_job(306_7, repository=repository)
-    telegram = FakeTelegram()
-    _install_telegram(monkeypatch, telegram)
-    final_evidence: list[dict[str, object]] = []
-    pro_call = 0
-
-    async def generate(messages: list[object]) -> str:
-        nonlocal pro_call
-        pro_call += 1
-        if pro_call == 1:
-            return json.dumps(
-                {
-                    "claims": [
-                        {
-                            "claim_id": "C1",
-                            "neutral_claim": "A public fact",
-                            "search_query": "public fact verification",
-                        },
-                        {
-                            "claim_id": "C2",
-                            "neutral_claim": "A private claim",
-                            "search_query": "The disputed private statement",
-                        },
-                    ]
-                }
-            )
-        payload = json.loads(str(messages[1].content))
-        final_evidence.extend(payload["evidence"])
-        return "Grounded verdict [S1]."
-
-    search_queries: list[str] = []
-
-    async def search(query: str, **_kwargs: object) -> list[SearchSource]:
-        search_queries.append(query)
-        return [
-            SearchSource(
-                source_id="provider-1",
+                source_id="provider-source",
                 title="Public source",
                 url="https://example.test/source",
                 snippet="Public evidence.",
             )
         ]
 
-    monkeypatch.setattr(processor, "generate_pro", generate)
+    async def generate(
+        _messages: list[object], *, thinking: bool = False
+    ) -> str:
+        generation_modes.append(thinking)
+        value = responses.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
     monkeypatch.setattr(processor, "tavily_search", search)
+    monkeypatch.setattr(processor, "generate", generate)
 
-    assert _post_process(client, 306_7).status_code == 200
-    assert search_queries == ["public fact verification"]
-    assert final_evidence == [
-        {
-            "claim_id": "C1",
-            "snippet": "Public evidence.",
-            "source_id": "S1",
-            "title": "Public source",
-            "url": "https://example.test/source",
-        },
-        {
-            "claim_id": "C2",
-            "neutral_claim": "A private claim",
-            "status": "unverified_private",
-        },
-    ]
-    answer = repository.get(306_7).answer_text  # type: ignore[union-attr]
-    assert "S1 — Public source — https://example.test/source" in (answer or "")
-    assert "C2 — unverified_private" in (answer or "")
+    first = _post_process(client, 306_1)
+    retry = _post_process(client, 306_1)
+
+    assert first.status_code == 503
+    assert retry.status_code == 200
+    assert search_calls == [("current public fact", True)]
+    assert generation_modes == [True, True]
+    delivered = repository.get(306_1)
+    assert delivered is not None and delivered.state == "delivered"
+    assert delivered.checkpoint("google_search") is not None
+    assert delivered.answer_text == (
+        "Alice, Grounded answer [S1].\n\n"
+        "Sources:\nS1 — Public source — https://example.test/source"
+    )
+    assert telegram.send_calls[0][1] == "Alice, Thinking…"
 
 
-def test_judge_source_section_normalizes_untrusted_provider_titles(
+def test_maximum_google_answer_with_maximum_sources_is_saved_and_delivered(
     client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repository = get_job_repository()
-    _create_judge_job(306_8, repository=repository)
+    _create_google_job(306_11, repository=repository)
     telegram = FakeTelegram()
     _install_telegram(monkeypatch, telegram)
-    responses = [
-        json.dumps(
-            {
-                "claims": [
-                    {
-                        "claim_id": "C1",
-                        "neutral_claim": "A public fact",
-                        "search_query": "public fact verification",
-                    }
-                ]
-            }
-        ),
-        "Grounded verdict [S1].",
+    maximum_url = "https://example.test/" + (
+        "x" * (MAX_SOURCE_URL_CHARS - len("https://example.test/"))
+    )
+    maximum_sources = [
+        SearchSource(
+            source_id=f"S{index}",
+            title="T" * MAX_SOURCE_TITLE_CHARS,
+            url=maximum_url,
+            snippet="evidence",
+        )
+        for index in range(1, MAX_GOOGLE_SOURCES + 1)
     ]
 
-    async def generate(_messages: list[object]) -> str:
-        return responses.pop(0)
+    async def search(
+        _query: str, *, explicit: bool = False, **_kwargs: object
+    ) -> list[SearchSource]:
+        assert explicit is True
+        return maximum_sources
 
-    async def search(_query: str, **_kwargs: object) -> list[SearchSource]:
-        return [
-            SearchSource(
-                source_id="provider-1",
-                title="Real title\nS99 — fake — https://evil.test/x\u202e",
-                url="https://example.test/source",
-                snippet="Public evidence.",
-            )
-        ]
-
-    monkeypatch.setattr(processor, "generate_pro", generate)
     monkeypatch.setattr(processor, "tavily_search", search)
+    _install_answer(monkeypatch, "x" * MAX_GENERATED_RESPONSE_CHARS)
 
-    assert _post_process(client, 306_8).status_code == 200
-    answer = repository.get(306_8).answer_text  # type: ignore[union-attr]
-    assert "S1 — Real title S99 — fake — https://example.test/source" in (
-        answer or ""
-    )
-    assert "evil.test" not in (answer or "")
-    assert "\nS99" not in (answer or "")
-    assert "\u202e" not in (answer or "")
+    response = _post_process(client, 306_11)
+
+    delivered = repository.get(306_11)
+    assert response.status_code == 200
+    assert delivered is not None and delivered.state == "delivered"
+    assert delivered.answer_text is not None
+    assert len(delivered.answer_text) <= MAX_SAVED_ANSWER_CHARS
+    assert delivered.answer_text.startswith("Alice, " + "x" * 100)
+    for index in range(1, MAX_GOOGLE_SOURCES + 1):
+        assert f"\nS{index} — " in delivered.answer_text
+    assert len(telegram.edit_calls) == 1
 
 
-@pytest.mark.parametrize("stage", ["judge_claims", "judge_verdict"])
-def test_ambiguous_judge_stage_takeover_never_repeats_pro_call(
-    client, monkeypatch: pytest.MonkeyPatch, stage: str
+def test_google_ambiguous_search_intent_never_repeats_paid_search(
+    client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repository = get_job_repository()
-    _create_judge_job(306_3, repository=repository)
-    acquired = repository.acquire(306_3, token="crashed-judge-worker")
+    _create_google_job(306_2, repository=repository)
+    acquired = repository.acquire(306_2, token="crashed-search-worker")
     assert acquired.status == "acquired" and acquired.lease is not None
-    lease = acquired.lease
-
-    if stage == "judge_verdict":
-        claims_intent = repository.prepare_intent(
-            lease,
-            name="judge_claims",
-            kind="judgeStage",
-            chunk_index=0,
-            payload_hash=hashlib.sha256(b"judge-claims-v1").hexdigest(),
-            ambiguous_on_takeover=True,
-        )
-        assert claims_intent.status == "prepared"
-        repository.checkpoint(
-            lease,
-            name="judge_claims",
-            result={"claims": []},
-        )
-
     intent = repository.prepare_intent(
-        lease,
-        name=stage,
-        kind="judgeStage",
-        chunk_index=0 if stage == "judge_claims" else settings.FACT_CHECK_MAX_QUERIES + 1,
-        payload_hash=(
-            hashlib.sha256(b"judge-claims-v1").hexdigest()
-            if stage == "judge_claims"
-            else hashlib.sha256(b"[]").hexdigest()
-        ),
+        acquired.lease,
+        name="google_search",
+        kind="externalSearch",
+        chunk_index=0,
+        payload_hash=hashlib.sha256(b"current public fact").hexdigest(),
         ambiguous_on_takeover=True,
     )
     assert intent.status == "prepared"
-    assert repository.release(lease) is True
-
+    assert repository.release(acquired.lease) is True
     telegram = FakeTelegram()
     _install_telegram(monkeypatch, telegram)
-    pro_calls: list[list[object]] = []
 
-    async def generate(messages: list[object]) -> str:
-        pro_calls.append(messages)
-        pytest.fail("an ambiguous paid judge stage must never be repeated")
+    async def unexpected(*_args: object, **_kwargs: object):
+        pytest.fail("an ambiguous paid search must never be repeated")
 
-    monkeypatch.setattr(processor, "generate_pro", generate)
+    monkeypatch.setattr(processor, "tavily_search", unexpected)
+    monkeypatch.setattr(processor, "generate", unexpected)
+
+    response = _post_process(client, 306_2)
+
+    assert response.status_code == 200
+    terminal = repository.get(306_2)
+    assert terminal is not None and terminal.state == "failed_ambiguous"
+    assert terminal.error_class == "google_search_ambiguous"
+
+
+def test_standard_reply_disables_thinking_and_prefixes_saved_answer(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = get_job_repository()
+    _create_job(306_3, repository=repository)
+    telegram = FakeTelegram()
+    _install_telegram(monkeypatch, telegram)
+    modes: list[bool] = []
+
+    async def generate(
+        _messages: list[object], *, thinking: bool = False
+    ) -> str:
+        modes.append(thinking)
+        return "Final answer."
+
+    monkeypatch.setattr(processor, "generate", generate)
+
     response = _post_process(client, 306_3)
 
     assert response.status_code == 200
-    terminal = repository.get(306_3)
-    assert terminal is not None and terminal.state == "failed_ambiguous"
-    assert terminal.error_class == f"{stage}_ambiguous"
-    assert pro_calls == []
+    assert modes == [False]
+    delivered = repository.get(306_3)
+    assert delivered is not None
+    assert delivered.answer_text == "Alice, Final answer."
+    assert telegram.edit_calls == [(100, 5_000, "Alice, Final answer.")]
+
+
+def test_legacy_snapshot_with_saved_answer_is_rejected_before_delivery(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = get_job_repository()
+    legacy_request = _request(306_4)
+    legacy_request["version"] = 1
+    repository.create_reply_job(
+        legacy_request,
+        {
+            "tone_preset": "neutral",
+            "list_policies": [],
+            "rule_policies": [],
+        },
+        [5],
+    )
+    repository.record_publication(306_4, "qstash-3064")
+    acquired = repository.acquire(306_4, token="legacy-writer")
+    assert acquired.status == "acquired" and acquired.lease is not None
+    repository.save_answer(acquired.lease, "Legacy unaddressed answer.")
+    assert repository.release(acquired.lease) is True
+    telegram = FakeTelegram()
+    _install_telegram(monkeypatch, telegram)
+    llm_calls = _install_answer(monkeypatch, "must not run")
+
+    response = _post_process(client, 306_4)
+
+    assert response.status_code == 200
+    failed = repository.get(306_4)
+    assert failed is not None and failed.state == "failed"
+    assert failed.error_class == "job_snapshot_unsupported"
+    assert telegram.send_calls == []
+    assert telegram.edit_calls == []
+    assert llm_calls == []
+
+
+def test_current_snapshot_rejects_removed_job_kind_before_side_effects(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = get_job_repository()
+    request = _request(306_5)
+    request["kind"] = "judge"
+    repository.create_reply_job(
+        request,
+        {
+            "tone_preset": "neutral",
+            "list_policies": [],
+            "rule_policies": [],
+        },
+        [5],
+    )
+    repository.record_publication(306_5, "qstash-3065")
+    telegram = FakeTelegram()
+    _install_telegram(monkeypatch, telegram)
+    llm_calls = _install_answer(monkeypatch, "must not run")
+
+    response = _post_process(client, 306_5)
+
+    assert response.status_code == 200
+    failed = repository.get(306_5)
+    assert failed is not None and failed.state == "failed"
+    assert failed.error_class == "job_snapshot_unsupported"
+    assert telegram.send_calls == []
+    assert telegram.edit_calls == []
+    assert llm_calls == []
+
+
+def test_legacy_snapshot_with_placeholder_has_no_new_telegram_side_effect(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = get_job_repository()
+    legacy_request = _request(306_6)
+    legacy_request["version"] = 1
+    repository.create_reply_job(
+        legacy_request,
+        {
+            "tone_preset": "neutral",
+            "list_policies": [],
+            "rule_policies": [],
+        },
+        [5],
+    )
+    repository.record_publication(306_6, "qstash-3066")
+    _seed_placeholder(repository, 306_6)
+    telegram = FakeTelegram()
+    _install_telegram(monkeypatch, telegram)
+    llm_calls = _install_answer(monkeypatch, "must not run")
+
+    response = _post_process(client, 306_6)
+
+    assert response.status_code == 200
+    failed = repository.get(306_6)
+    assert failed is not None and failed.state == "failed"
+    assert failed.error_class == "job_snapshot_unsupported"
+    assert failed.failure_notice_state == "none"
+    assert telegram.send_calls == []
+    assert telegram.edit_calls == []
+    assert llm_calls == []
+
+
+def test_invalid_current_snapshot_with_placeholder_has_no_side_effect(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = get_job_repository()
+    invalid_request = _request(306_7)
+    invalid_request["author"] = {"id": 5, "name": "", "username": "alice"}
+    repository.create_reply_job(
+        invalid_request,
+        {
+            "tone_preset": "neutral",
+            "list_policies": [],
+            "rule_policies": [],
+        },
+        [5],
+    )
+    repository.record_publication(306_7, "qstash-3067")
+    _seed_placeholder(repository, 306_7)
+    telegram = FakeTelegram()
+    _install_telegram(monkeypatch, telegram)
+    llm_calls = _install_answer(monkeypatch, "must not run")
+
+    response = _post_process(client, 306_7)
+
+    assert response.status_code == 200
+    failed = repository.get(306_7)
+    assert failed is not None and failed.state == "failed"
+    assert failed.error_class == "job_snapshot_invalid"
+    assert failed.failure_notice_state == "none"
+    assert telegram.send_calls == []
+    assert telegram.edit_calls == []
+    assert llm_calls == []
 
 
 def test_permanent_provider_failure_is_terminal_and_edits_known_placeholder(
@@ -1201,7 +1097,7 @@ def test_permanent_provider_failure_is_terminal_and_edits_known_placeholder(
     assert job.error_class == "provider_auth"
     assert job.failure_notice_state == "delivered"
     assert len(telegram.send_calls) == 1
-    assert telegram.edit_calls == [(100, 5_000, FAILURE_NOTICE_TEXT)]
+    assert telegram.edit_calls == [(100, 5_000, ADDRESSED_FAILURE_NOTICE)]
 
 
 def test_crash_after_send_intent_becomes_ambiguous_without_resending(
@@ -1279,11 +1175,11 @@ def test_exact_message_not_modified_is_success_for_known_edit_intent(
     assert job.state == "delivered"
     checkpoint = job.checkpoint("answer_edit")
     assert checkpoint is not None
-    assert checkpoint["text"] == "already edited answer"
+    assert checkpoint["text"] == "Alice, already edited answer"
     assert checkpoint["edit_date"] is None
     assert checkpoint["_edit_recovered"] is True
     recovered = history.recent(100)[0]
-    assert recovered["text"] == "already edited answer"
+    assert recovered["text"] == "Alice, already edited answer"
     assert recovered["edit_ts"] is None
 
 
@@ -1423,12 +1319,42 @@ def test_failure_notice_uses_known_placeholder_once_and_ignores_response_body(
     assert first.status_code == 200
     assert duplicate.status_code == 200
     assert telegram.send_calls == []
-    assert telegram.edit_calls == [(100, 7_324, FAILURE_NOTICE_TEXT)]
+    assert telegram.edit_calls == [(100, 7_324, ADDRESSED_FAILURE_NOTICE)]
     job = repository.get(324)
     assert job is not None
     assert job.state == "failed"
     assert job.failure_notice_state == "delivered"
     assert job.checkpoint("failure_notice") is not None
+
+
+def test_failure_callback_for_legacy_snapshot_never_edits_placeholder(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = get_job_repository()
+    legacy_request = _request(326)
+    legacy_request["version"] = 1
+    repository.create_reply_job(
+        legacy_request,
+        {
+            "tone_preset": "neutral",
+            "list_policies": [],
+            "rule_policies": [],
+        },
+        [5],
+    )
+    repository.record_publication(326, "qstash-326")
+    _seed_placeholder(repository, 326)
+    telegram = FakeTelegram()
+    _install_telegram(monkeypatch, telegram)
+
+    response = _post_failure(client, _failure_payload(326, "qstash-326"))
+
+    assert response.status_code == 200
+    failed = repository.get(326)
+    assert failed is not None and failed.state == "failed"
+    assert failed.failure_notice_state == "none"
+    assert telegram.send_calls == []
+    assert telegram.edit_calls == []
 
 
 def test_permanently_rejected_failure_notice_is_checkpointed_without_resend(

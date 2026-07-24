@@ -25,6 +25,10 @@ from app.store.jobs import (
     lease_key,
     user_index_key,
 )
+from app.telegram.job_contract import (
+    MAX_GENERATED_RESPONSE_CHARS,
+    MAX_SAVED_ANSWER_CHARS,
+)
 
 NOW = 1_000
 
@@ -734,7 +738,8 @@ def test_answer_validation() -> None:
     _create(repository)
     lease = _acquire(repository)
 
-    for invalid in ("", "x" * 64_001):
+    assert MAX_SAVED_ANSWER_CHARS >= MAX_GENERATED_RESPONSE_CHARS + 12_000
+    for invalid in ("", "x" * (MAX_SAVED_ANSWER_CHARS + 1)):
         with pytest.raises(ValueError, match="answer"):
             repository.save_answer(lease, invalid, now=NOW)
 
@@ -871,6 +876,42 @@ def test_failure_takeover_requires_the_job_retry_policy():
         repository.failure_takeover(101, "qstash-101", max_retries=4, now=NOW).status
         == "failed"
     )
+
+
+def test_failure_takeover_can_suppress_notice_even_with_a_placeholder():
+    repository = _repository()
+    _create(repository)
+    repository.record_publication(101, "qstash-101", now=NOW)
+    lease = _acquire(repository)
+    repository.prepare_intent(
+        lease,
+        name="placeholder",
+        kind="sendMessage",
+        chunk_index=-1,
+        payload_hash="a" * 64,
+        ambiguous_on_takeover=True,
+        now=NOW,
+    )
+    repository.checkpoint(
+        lease,
+        name="placeholder",
+        result={"message_id": 501},
+        now=NOW,
+    )
+    assert repository.release(lease, now=NOW) is True
+
+    takeover = repository.failure_takeover(
+        101,
+        "qstash-101",
+        failure_notice_text=None,
+        now=NOW,
+    )
+
+    assert takeover.status == "failed"
+    assert takeover.job is not None
+    assert takeover.job.failure_notice_state == "none"
+    assert "failure_notice_hash" not in takeover.job.raw
+    assert "failure_notice_text" not in takeover.job.raw
 
 
 def test_concurrent_failure_takeover_has_one_fence_increment() -> None:

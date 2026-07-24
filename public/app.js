@@ -10,6 +10,13 @@ function feedback(message, error = false) {
   node.className = error ? "error" : "success";
 }
 
+function restoreButtonStates() {
+  const hasOwnerContact = Boolean(byId("owner-contact").value.trim());
+  document.querySelectorAll("button").forEach((button) => {
+    button.disabled = button.id === "copy-notice" && !hasOwnerContact;
+  });
+}
+
 async function api(path, options = {}) {
   const method = options.method || "GET";
   const mutation = !['GET', 'HEAD'].includes(method);
@@ -35,7 +42,7 @@ async function api(path, options = {}) {
   } finally {
     if (mutation) {
       activeMutations -= 1;
-      if (activeMutations === 0) document.querySelectorAll("button").forEach((button) => { button.disabled = false; });
+      if (activeMutations === 0) restoreButtonStates();
     }
   }
 }
@@ -59,24 +66,6 @@ function textCard(title, details, actions = []) {
   });
   card.append(heading, body, actionBar);
   return card;
-}
-
-async function loadAdmins() {
-  const data = await api("/api/admin/admins");
-  const container = byId("admin-list");
-  container.replaceChildren();
-  data.admins.forEach((item) => {
-    const profile = item.profile || {};
-    const actions = [];
-    if (state.me.is_super_admin && !item.is_super_admin) {
-      actions.push({label: "Revoke", danger: true, run: async () => {
-        if (!window.confirm(`Revoke administrator ${item.user_id}?`)) return;
-        try { await api(`/api/admin/admins/${item.user_id}`, {method: "DELETE"}); await loadAdmins(); feedback("Administrator revoked."); } catch (error) { feedback(error.message, true); }
-      }});
-    }
-    container.append(textCard(item.is_super_admin ? "Super admin" : "Admin", `${profile.name || "Unobserved user"}\nID: ${item.user_id}\nUsername: ${profile.username ? `@${profile.username}` : "—"}`, actions));
-  });
-  byId("admin-form").hidden = !state.me.is_super_admin;
 }
 
 async function loadLists() {
@@ -159,10 +148,7 @@ function fillToneForm() {
   if (!state.tone) return;
   const scope = byId("tone-scope").value;
   const value = scope === "global" ? state.tone.global : (state.tone.chat_override || state.tone.effective);
-  byId("tone-mode").value = value.tone_mode;
   byId("tone-preset").value = value.tone_preset;
-  byId("tone-custom").value = value.custom_system_prompt || "";
-  byId("tone-judge-n").value = value.judge_default_n;
 }
 
 async function loadLogs() {
@@ -176,32 +162,37 @@ async function loadLogs() {
   if (!data.records.length) container.textContent = "No retained records.";
 }
 
+function renderPrivacyNotice() {
+  const retention = state.me.retention;
+  const historyDuration = `${retention.history_seconds} seconds`;
+  const jobDuration = `${retention.job_seconds} seconds`;
+  const contact = byId("owner-contact").value.trim();
+  const copyButton = byId("copy-notice");
+  copyButton.disabled = !contact;
+  byId("privacy-notice").value = contact
+    ? `Privacy notice for this group: Kulajaj retains up to ${retention.history_limit} recent messages for no longer than ${historyDuration}. Expired records are excluded and removed on the next access. The entire buffer expires after ${historyDuration} without activity. Observed profiles and list membership remain until the owner deletes them. Durable model-job snapshots are retained for up to ${jobDuration}. Selected context is processed by NVIDIA NIM. When a participant explicitly uses /google, Tavily receives that command's bounded search query. Recent group history is not sent to Tavily. QStash receives only an opaque job ID. Owner contact: ${contact}. Contact that owner to request profile, message, or full-chat deletion. Data already sent to an external provider cannot be recalled.`
+    : "";
+}
+
 function configurePrivacy() {
   const retention = state.me.retention;
-  const days = Math.round(retention.history_seconds / 86400);
-  const jobDays = Math.round(retention.job_seconds / 86400);
-  byId("retention").textContent = `The bot retains at most ${retention.history_limit} recent messages. Records older than ${days} days are removed on next access, and the entire history expires after ${days} idle days. Private job snapshots expire after ${jobDays} days.`;
-  byId("privacy-notice").value = `Privacy notice for this group: Kulajaj retains up to ${retention.history_limit} recent messages for up to ${days} days, with the whole buffer expiring after ${days} days without activity. Observed profiles and list membership remain until an administrator deletes them. Private reply snapshots are retained for up to ${jobDays} days. Selected context is processed by NVIDIA NIM. Tavily receives only de-identified factual search queries; QStash receives only an opaque job ID. Contact the group administrator to request profile, message, or full-chat deletion. Data already sent to an external provider cannot be recalled.`;
+  const historyDuration = `${retention.history_seconds} seconds`;
+  const jobDuration = `${retention.job_seconds} seconds`;
+  byId("retention").textContent = `The bot retains at most ${retention.history_limit} recent messages. Expired records are excluded and removed on the next access. The entire history expires after ${historyDuration} without activity. Durable model-job snapshots expire after ${jobDuration}.`;
+  byId("owner-contact").value = state.me.username ? `@${state.me.username}` : "";
+  renderPrivacyNotice();
   byId("delete-user-form").hidden = !state.me.is_super_admin;
   byId("purge-form").hidden = !state.me.is_super_admin;
 }
 
 async function loadAll() {
-  await Promise.all([loadAdmins(), loadLists(), loadRules(), loadTone(), loadLogs()]);
+  await Promise.all([loadLists(), loadRules(), loadTone(), loadLogs()]);
   configurePrivacy();
 }
 
 byId("user-search-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   try { const data = await api(`/api/admin/users?q=${encodeURIComponent(byId("user-query").value)}`); byId("user-result").textContent = JSON.stringify(data, null, 2); feedback("User lookup complete."); } catch (error) { byId("user-result").textContent = error.message; feedback(error.message, true); }
-});
-
-byId("admin-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const id = byId("admin-user-id").value.trim();
-  const username = byId("admin-username").value.trim();
-  const body = id ? {user_id: Number(id)} : {username};
-  try { await api("/api/admin/admins", {method: "POST", body: JSON.stringify(body)}); event.target.reset(); await loadAdmins(); feedback("Administrator added after Telegram membership verification."); } catch (error) { feedback(error.message, true); }
 });
 
 byId("list-form").addEventListener("submit", async (event) => {
@@ -234,8 +225,7 @@ byId("rule-reset").addEventListener("click", resetRule);
 
 byId("tone-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  const custom = byId("tone-custom").value.trim();
-  const body = {scope: byId("tone-scope").value, tone_mode: byId("tone-mode").value, tone_preset: byId("tone-preset").value, custom_system_prompt: custom || null, judge_default_n: Number(byId("tone-judge-n").value)};
+  const body = {scope: byId("tone-scope").value, tone_preset: byId("tone-preset").value};
   try { await api("/api/admin/tone", {method: "PUT", body: JSON.stringify(body)}); await loadTone(); feedback("Tone configuration saved."); } catch (error) { feedback(error.message, true); }
 });
 byId("tone-scope").addEventListener("change", fillToneForm);
@@ -246,7 +236,7 @@ byId("delete-user-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const userId = Number(byId("delete-user-id").value);
   if (!window.confirm(`Delete retained data for user ${userId}?`)) return;
-  try { await api(`/api/admin/users/${userId}?purge_messages=${byId("delete-user-messages").checked}`, {method: "DELETE"}); event.target.reset(); await Promise.all([loadAdmins(), loadLists(), loadLogs()]); feedback("User data deleted."); } catch (error) { feedback(error.message, true); }
+  try { await api(`/api/admin/users/${userId}?purge_messages=${byId("delete-user-messages").checked}`, {method: "DELETE"}); event.target.reset(); await Promise.all([loadLists(), loadLogs()]); feedback("User data deleted."); } catch (error) { feedback(error.message, true); }
 });
 
 byId("purge-form").addEventListener("submit", async (event) => {
@@ -256,7 +246,12 @@ byId("purge-form").addEventListener("submit", async (event) => {
   try { await api("/api/admin/logs", {method: "DELETE", body: JSON.stringify({confirmation})}); event.target.reset(); await loadLogs(); feedback("Chat history and indexed jobs purged."); } catch (error) { feedback(error.message, true); }
 });
 
-byId("copy-notice").addEventListener("click", async () => { try { await navigator.clipboard.writeText(byId("privacy-notice").value); feedback("Privacy notice copied."); } catch (_error) { feedback("Copy failed; select the notice manually.", true); }});
+byId("owner-contact").addEventListener("input", renderPrivacyNotice);
+byId("copy-notice").addEventListener("click", async () => {
+  const contact = byId("owner-contact").value.trim();
+  if (!contact) { feedback("Enter a monitored owner contact before copying.", true); return; }
+  try { await navigator.clipboard.writeText(byId("privacy-notice").value); feedback("Privacy notice copied."); } catch (_error) { feedback("Copy failed; select the notice manually.", true); }
+});
 byId("logout").addEventListener("click", async () => { try { await api("/api/auth/logout", {method: "POST"}); window.location.assign("/"); } catch (error) { feedback(error.message, true); }});
 
 async function boot() {

@@ -22,7 +22,12 @@ from tests.conftest import make_update
 
 BOT_ID = 999
 BOT_USERNAME = "test_bot"
-VERIFIED_BOT = BotIdentity(id=BOT_ID, username=BOT_USERNAME)
+BOT_FIRST_NAME = "Test Bot"
+VERIFIED_BOT = BotIdentity(
+    id=BOT_ID,
+    username=BOT_USERNAME,
+    first_name=BOT_FIRST_NAME,
+)
 
 
 def _utf16_units(value: str) -> int:
@@ -108,7 +113,11 @@ def test_configured_and_verified_username_must_both_match(monkeypatch):
     assert (
         detect_explicit_route(
             msg,
-            identity_loader=lambda: BotIdentity(id=BOT_ID, username="another_bot"),
+            identity_loader=lambda: BotIdentity(
+                id=BOT_ID,
+                username="another_bot",
+                first_name=BOT_FIRST_NAME,
+            ),
         )
         is None
     )
@@ -314,7 +323,13 @@ def test_valid_cached_identity_avoids_get_me(monkeypatch):
     store = get_store()
     store.set(
         identity.BOT_IDENTITY_KEY,
-        json.dumps({"id": BOT_ID, "username": "TEST_BOT"}),
+        json.dumps(
+            {
+                "id": BOT_ID,
+                "username": "TEST_BOT",
+                "first_name": BOT_FIRST_NAME,
+            }
+        ),
     )
 
     def unexpected_get_me():
@@ -325,6 +340,26 @@ def test_valid_cached_identity_avoids_get_me(monkeypatch):
     assert identity.get_bot_identity() == BotIdentity(
         id=BOT_ID,
         username="TEST_BOT",
+        first_name=BOT_FIRST_NAME,
+    )
+
+
+def test_verified_identity_preserves_telegram_first_name(monkeypatch):
+    monkeypatch.setattr(
+        identity.telegram_client,
+        "get_me",
+        lambda: {
+            "id": BOT_ID,
+            "username": BOT_USERNAME,
+            "first_name": "Kulajaj",
+        },
+    )
+
+    verified = identity.get_bot_identity()
+
+    assert verified.first_name == "Kulajaj"
+    assert json.loads(get_store().get(identity.BOT_IDENTITY_KEY))["first_name"] == (
+        "Kulajaj"
     )
 
 
@@ -333,17 +368,28 @@ def test_valid_cached_identity_avoids_get_me(monkeypatch):
     [
         pytest.param("not-json", id="invalid-json"),
         pytest.param("[]", id="wrong-json-shape"),
-        pytest.param('{"id":0,"username":"test_bot"}', id="invalid-id"),
-        pytest.param('{"id":true,"username":"test_bot"}', id="boolean-id"),
         pytest.param(
-            '{"id":999,"username":"other_bot"}',
+            '{"id":0,"username":"test_bot","first_name":"Test Bot"}',
+            id="invalid-id",
+        ),
+        pytest.param(
+            '{"id":true,"username":"test_bot","first_name":"Test Bot"}',
+            id="boolean-id",
+        ),
+        pytest.param(
+            '{"id":999,"username":"other_bot","first_name":"Test Bot"}',
             id="configured-username-mismatch",
+        ),
+        pytest.param(
+            '{"id":999,"username":"test_bot"}',
+            id="missing-first-name",
         ),
         pytest.param(
             json.dumps(
                 {
                     "id": BOT_ID,
                     "username": BOT_USERNAME,
+                    "first_name": BOT_FIRST_NAME,
                     "padding": "x" * identity.MAX_BOT_IDENTITY_JSON_CHARS,
                 }
             ),
@@ -361,18 +407,24 @@ def test_invalid_cached_identity_is_refreshed_from_get_me(
     def get_me():
         nonlocal get_me_calls
         get_me_calls += 1
-        return {"id": BOT_ID, "username": "Test_Bot"}
+        return {
+            "id": BOT_ID,
+            "username": "Test_Bot",
+            "first_name": BOT_FIRST_NAME,
+        }
 
     monkeypatch.setattr(identity.telegram_client, "get_me", get_me)
 
     assert identity.get_bot_identity() == BotIdentity(
         id=BOT_ID,
         username="Test_Bot",
+        first_name=BOT_FIRST_NAME,
     )
     assert get_me_calls == 1
     assert json.loads(store.get(identity.BOT_IDENTITY_KEY)) == {
         "id": BOT_ID,
         "username": "Test_Bot",
+        "first_name": BOT_FIRST_NAME,
     }
 
 
@@ -384,7 +436,11 @@ def test_get_me_is_lazy_and_result_is_cached_with_a_bounded_ttl(monkeypatch):
     def get_me():
         nonlocal get_me_calls
         get_me_calls += 1
-        return {"id": BOT_ID, "username": BOT_USERNAME}
+        return {
+            "id": BOT_ID,
+            "username": BOT_USERNAME,
+            "first_name": BOT_FIRST_NAME,
+        }
 
     monkeypatch.setattr(identity.telegram_client, "get_me", get_me)
     before = time.time()
@@ -396,7 +452,9 @@ def test_get_me_is_lazy_and_result_is_cached_with_a_bounded_ttl(monkeypatch):
     assert first == second == VERIFIED_BOT
     assert get_me_calls == 1
     cached = store.get(identity.BOT_IDENTITY_KEY)
-    assert cached == '{"id":999,"username":"test_bot"}'
+    assert cached == (
+        '{"id":999,"username":"test_bot","first_name":"Test Bot"}'
+    )
     assert len(cached) <= identity.MAX_BOT_IDENTITY_JSON_CHARS
     expires_at = store._expiry[identity.BOT_IDENTITY_KEY]
     assert before + identity.BOT_IDENTITY_CACHE_SECONDS <= expires_at
@@ -406,10 +464,38 @@ def test_get_me_is_lazy_and_result_is_cached_with_a_bounded_ttl(monkeypatch):
 @pytest.mark.parametrize(
     "get_me_result",
     [
-        pytest.param({"id": BOT_ID, "username": "other_bot"}, id="username-mismatch"),
-        pytest.param({"id": 0, "username": BOT_USERNAME}, id="non-positive-id"),
-        pytest.param({"id": True, "username": BOT_USERNAME}, id="boolean-id"),
-        pytest.param({"id": BOT_ID}, id="missing-username"),
+        pytest.param(
+            {
+                "id": BOT_ID,
+                "username": "other_bot",
+                "first_name": BOT_FIRST_NAME,
+            },
+            id="username-mismatch",
+        ),
+        pytest.param(
+            {
+                "id": 0,
+                "username": BOT_USERNAME,
+                "first_name": BOT_FIRST_NAME,
+            },
+            id="non-positive-id",
+        ),
+        pytest.param(
+            {
+                "id": True,
+                "username": BOT_USERNAME,
+                "first_name": BOT_FIRST_NAME,
+            },
+            id="boolean-id",
+        ),
+        pytest.param(
+            {"id": BOT_ID, "first_name": BOT_FIRST_NAME},
+            id="missing-username",
+        ),
+        pytest.param(
+            {"id": BOT_ID, "username": BOT_USERNAME},
+            id="missing-first-name",
+        ),
         pytest.param([], id="wrong-shape"),
     ],
 )
@@ -495,7 +581,11 @@ def test_identity_cache_write_failure_is_sanitized(monkeypatch):
     monkeypatch.setattr(
         identity.telegram_client,
         "get_me",
-        lambda: {"id": BOT_ID, "username": BOT_USERNAME},
+        lambda: {
+            "id": BOT_ID,
+            "username": BOT_USERNAME,
+            "first_name": BOT_FIRST_NAME,
+        },
     )
 
     with pytest.raises(BotIdentityUnavailable) as exc:

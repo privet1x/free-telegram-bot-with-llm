@@ -16,7 +16,11 @@ from tests.conftest import make_update, post_webhook
 
 
 BOT_ID = 999
-BOT_IDENTITY = BotIdentity(id=BOT_ID, username="test_bot")
+BOT_IDENTITY = BotIdentity(
+    id=BOT_ID,
+    username="test_bot",
+    first_name="Test Bot",
+)
 
 
 def _now() -> int:
@@ -210,7 +214,7 @@ def test_retry_reuses_immutable_snapshot_and_server_computed_role(
     assert before.state == "received"
     original_request = before.request
     original_policy = before.effective_policy
-    assert original_policy["actor"] == {"user_id": 5, "is_admin": True}
+    assert "actor" not in original_policy
     assert already_seen(205) is False
 
     monkeypatch.setattr(webhook_module.settings, "SUPER_ADMIN_ID", None)

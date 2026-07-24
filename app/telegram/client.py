@@ -18,10 +18,12 @@ from typing import Any, Optional
 import httpx
 
 from app.settings import settings
+from app.telegram.addressing import normalize_first_name
 
 _client: Optional[httpx.Client] = None
 _lock = threading.Lock()
 MAX_TELEGRAM_CHUNK_CHARS = 4_000
+MAX_TELEGRAM_IMAGE_BYTES = 5 * 1024 * 1024
 
 
 def _http() -> httpx.Client:
@@ -194,6 +196,70 @@ def get_chat_member(chat_id: int, user_id: int) -> dict:
     return result
 
 
+def get_file(file_id: str) -> dict:
+    """Resolve a Telegram file ID without exposing the bot token to callers."""
+    if not isinstance(file_id, str) or not file_id or len(file_id) > 256:
+        raise TelegramAPIError("Telegram file ID is invalid", method="getFile")
+    result = call("getFile", {"file_id": file_id})
+    if not isinstance(result, dict) or not isinstance(result.get("file_path"), str):
+        raise TelegramAPIError(
+            "getFile result is not a file object",
+            method="getFile",
+            outcome_unknown=True,
+        )
+    return result
+
+
+def download_file(file_path: str, *, max_bytes: int = MAX_TELEGRAM_IMAGE_BYTES) -> bytes:
+    """Download one bounded Telegram file for an ephemeral model request."""
+    if (
+        not isinstance(file_path, str)
+        or not file_path
+        or len(file_path) > 512
+        or any(ord(character) < 0x20 for character in file_path)
+        or max_bytes <= 0
+    ):
+        raise TelegramAPIError("Telegram file path is invalid", method="downloadFile")
+    url = f"https://api.telegram.org/file{_base_url()[len('https://api.telegram.org'):]}/{file_path}"
+    try:
+        with _http().stream("GET", url) as response:
+            if not 200 <= response.status_code < 300:
+                raise TelegramAPIError(
+                    "Telegram file download failed",
+                    method="downloadFile",
+                    status_code=response.status_code,
+                )
+            content_length = response.headers.get("content-length")
+            if content_length is not None:
+                try:
+                    if int(content_length) > max_bytes:
+                        raise TelegramAPIError(
+                            "Telegram file is too large",
+                            method="downloadFile",
+                            status_code=413,
+                        )
+                except ValueError:
+                    pass
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_bytes():
+                total += len(chunk)
+                if total > max_bytes:
+                    raise TelegramAPIError(
+                        "Telegram file is too large",
+                        method="downloadFile",
+                        status_code=413,
+                    )
+                chunks.append(chunk)
+            return b"".join(chunks)
+    except httpx.HTTPError:
+        raise TelegramAPIError(
+            "Telegram file download transport failure",
+            method="downloadFile",
+            transport_error=True,
+        ) from None
+
+
 def split_plain_text(text: str, limit: int = MAX_TELEGRAM_CHUNK_CHARS) -> list[str]:
     """Split plain text by Telegram's UTF-16 code-unit accounting."""
     if limit <= 0 or limit > MAX_TELEGRAM_CHUNK_CHARS:
@@ -257,10 +323,7 @@ def outbound_history_record(
     )
     username = sender.get("username") if isinstance(sender, dict) else None
     first_name = sender.get("first_name") if isinstance(sender, dict) else None
-    last_name = sender.get("last_name") if isinstance(sender, dict) else None
-    name = " ".join(
-        part for part in (first_name, last_name) if isinstance(part, str) and part
-    ) or str(username or "bot")
+    name = normalize_first_name(first_name) or "unknown"
 
     reply = result.get("reply_to_message")
     reply_to = None
@@ -293,7 +356,7 @@ def outbound_history_record(
         "source_update_id": source_update_id,
         "user_id": user_id,
         "username": username,
-        "name": name[:256],
+        "name": name,
         "text": str(text if text is not None else result.get("text") or "")[:4096],
         "ts": message_date,
         "edit_ts": normalized_edit_timestamp if edited else None,

@@ -6,6 +6,7 @@ import json
 from typing import Any, Optional
 
 from app.store.redis import get_store
+from app.telegram.addressing import normalize_first_name
 
 
 def normalize_username(username: Optional[str]) -> Optional[str]:
@@ -44,10 +45,11 @@ def observe(user: dict[str, Any]) -> dict[str, Any]:
     user_id = int(user["id"])
     username = user.get("username") or None
     normalized = normalize_username(username)
+    name = normalize_first_name(user.get("name")) or "unknown"
     record = {
         "id": user_id,
         "username": username,
-        "name": str(user.get("name") or username or "unknown"),
+        "name": name,
         "is_bot": bool(user.get("is_bot", False)),
         "last_seen_at": user.get("last_seen_at"),
         "last_update_id": user.get("last_update_id"),

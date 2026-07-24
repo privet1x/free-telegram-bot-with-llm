@@ -26,6 +26,7 @@ def fresh_store(monkeypatch):
     monkeypatch.setattr(settings, "QSTASH_CURRENT_SIGNING_KEY", "")
     monkeypatch.setattr(settings, "QSTASH_NEXT_SIGNING_KEY", "")
     monkeypatch.setattr(settings, "PUBLIC_BASE_URL", "")
+    monkeypatch.setattr(settings, "CRON_SECRET", "")
     monkeypatch.setattr(settings, "SUPER_ADMIN_ID", None)
     monkeypatch.setattr(settings, "JOB_RETENTION_SECONDS", 604_800)
     monkeypatch.setattr(settings, "WORKER_BUDGET_SECONDS", 240)

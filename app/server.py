@@ -15,13 +15,17 @@ from fastapi.staticfiles import StaticFiles
 
 from app.settings import production_config_errors, settings
 from app.store.redis import get_store
+from app.memory.store import static_shards
 from app.telegram.processor import router as processor_router
 from app.telegram.webhook import router as webhook_router
+from app.telegram.scheduler import router as scheduler_router
 from app.admin.routes import router as admin_router
 
 
 def create_app() -> FastAPI:
     application = FastAPI(title="tg-llm-bot", version="0.1.0")
+    # Fail closed on malformed trusted memory before serving a deployment.
+    static_shards()
 
     @application.middleware("http")
     async def security_headers(request, call_next):
@@ -37,6 +41,7 @@ def create_app() -> FastAPI:
             response.headers["Cache-Control"] = "no-store"
         return response
     application.include_router(webhook_router)
+    application.include_router(scheduler_router)
     application.include_router(processor_router)
     application.include_router(admin_router)
 

@@ -12,6 +12,8 @@ from app.store.redis import get_store
 LISTS_INDEX_KEY = "lists:index"
 IGNORE_SLUG = "ignore"
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+# Keep the legacy judge value readable until old Redis records expire. Current
+# API schemas accept only explicit and auto.
 _SCOPES = {"explicit", "auto", "judge"}
 _MAX_PROMPT = 8_000
 MAX_LISTS = 100

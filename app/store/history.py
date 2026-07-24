@@ -73,6 +73,44 @@ def recent(chat_id: int, n: int = HISTORY_LIMIT) -> list[dict]:
     return out[:n]
 
 
+def _epoch_matches(record: dict, memory_epoch: int | None) -> bool:
+    if memory_epoch is None:
+        return True
+    value = record.get("memory_epoch", 0)
+    return value == memory_epoch or (
+        memory_epoch == 0 and "memory_epoch" not in record
+    )
+
+
+def context(chat_id: int, memory_epoch: int, n: int = HISTORY_LIMIT) -> list[dict]:
+    """Return current-generation context while retaining older logs."""
+    return [
+        record
+        for record in recent(chat_id, HISTORY_LIMIT)
+        if _epoch_matches(record, memory_epoch)
+    ][:n]
+
+
+def recent_human(
+    chat_id: int, n: int = HISTORY_LIMIT, memory_epoch: int | None = None
+) -> list[dict]:
+    """Return newest human-authored records without counting bot messages."""
+    from app.settings import settings
+
+    bot_username = settings.TELEGRAM_BOT_USERNAME.strip().lstrip("@").casefold()
+    return [
+        record
+        for record in recent(chat_id, HISTORY_LIMIT)
+        if _epoch_matches(record, memory_epoch)
+        if record.get("is_bot") is not True
+        and (
+            not bot_username
+            or str(record.get("username") or "").strip().lstrip("@").casefold()
+            != bot_username
+        )
+    ][:n]
+
+
 def purge_user(
     chat_id: int, user_id: int, outbound_message_ids: set[int] | None = None
 ) -> int:

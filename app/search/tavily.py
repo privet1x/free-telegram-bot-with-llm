@@ -1,4 +1,4 @@
-"""Bounded, de-identified Tavily basic search adapter."""
+"""Bounded Tavily basic-search adapter for explicit and sanitized queries."""
 
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ from app.settings import settings
 
 TAVILY_ENDPOINT = "https://api.tavily.com/search"
 MAX_RESULTS = 3
+MAX_SOURCE_TITLE_CHARS = 256
+MAX_SOURCE_URL_CHARS = 2_048
 MAX_RESPONSE_BYTES = 256_000
 MAX_QUERY_CHARS = 240
 SEARCH_ATTEMPT_TIMEOUT_SECONDS = 6
@@ -23,7 +25,7 @@ _SEARCH_SEMAPHORE = asyncio.Semaphore(3)
 
 
 class TavilyUnavailable(RuntimeError):
-    """Search is unavailable; callers can degrade to logic-only reasoning."""
+    """Search is unavailable; callers can disclose degraded operation."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,8 +48,39 @@ def sanitize_source_title(value: object) -> str:
         for character in raw
     )
     without_urls = _TITLE_URL.sub("", without_controls)
-    normalized = " ".join(without_urls.split())[:256].strip(" -\u2013\u2014")
+    normalized = " ".join(without_urls.split())[
+        :MAX_SOURCE_TITLE_CHARS
+    ].strip(" -\u2013\u2014")
     return normalized or "Untitled source"
+
+
+def normalize_source_url(value: object) -> str | None:
+    """Accept one bounded HTTPS URL that is safe to render on one source line."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_SOURCE_URL_CHARS
+        or any(
+            character.isspace()
+            or unicodedata.category(character).startswith("C")
+            for character in value
+        )
+    ):
+        return None
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    return value
 
 
 def sanitize_query(query: str, forbidden_terms: tuple[str, ...] = ()) -> str | None:
@@ -74,13 +107,34 @@ def sanitize_query(query: str, forbidden_terms: tuple[str, ...] = ()) -> str | N
     return value
 
 
+def normalize_explicit_query(query: str) -> str | None:
+    """Bound a query that a user explicitly chose to send to Tavily."""
+    if not isinstance(query, str):
+        return None
+    without_controls = "".join(
+        " "
+        if character.isspace()
+        else ""
+        if unicodedata.category(character).startswith("C")
+        else character
+        for character in query
+    )
+    value = " ".join(without_controls.split())[:MAX_QUERY_CHARS]
+    return value or None
+
+
 async def search(
     query: str,
     *,
     client: httpx.AsyncClient | None = None,
     forbidden_terms: tuple[str, ...] = (),
+    explicit: bool = False,
 ) -> list[SearchSource]:
-    safe = sanitize_query(query, forbidden_terms)
+    safe = (
+        normalize_explicit_query(query)
+        if explicit
+        else sanitize_query(query, forbidden_terms)
+    )
     if safe is None or not settings.TAVILY_API_KEY:
         raise TavilyUnavailable("search_unavailable")
     owned = client is None
@@ -89,52 +143,41 @@ async def search(
         async with _SEARCH_SEMAPHORE:
             status_code: int | None = None
             response_body = b""
-            for attempt in range(2):
-                try:
-                    async with asyncio.timeout(SEARCH_ATTEMPT_TIMEOUT_SECONDS):
-                        async with http.stream(
-                            "POST",
-                            TAVILY_ENDPOINT,
-                            headers={
-                                "Authorization": f"Bearer {settings.TAVILY_API_KEY}"
-                            },
-                            json={
-                                "query": safe,
-                                "search_depth": "basic",
-                                "max_results": MAX_RESULTS,
-                            },
-                            timeout=httpx.Timeout(
-                                connect=3, read=5, write=3, pool=3
-                            ),
-                        ) as response:
-                            status_code = response.status_code
-                            response_body = b""
-                            if 200 <= status_code < 300:
-                                chunks = bytearray()
-                                async for chunk in response.aiter_bytes():
-                                    chunks.extend(chunk)
-                                    if len(chunks) > MAX_RESPONSE_BYTES:
-                                        raise TavilyUnavailable(
-                                            "search_response_too_large"
-                                        )
-                                response_body = bytes(chunks)
-                except (TimeoutError, httpx.TimeoutException, httpx.TransportError):
-                    if attempt == 1:
-                        raise TavilyUnavailable("search_unavailable") from None
-                    continue
-                if status_code == 429 or (
-                    status_code is not None and status_code >= 500
-                ):
-                    if attempt == 1:
-                        raise TavilyUnavailable("search_unavailable")
-                    continue
-                break
+            try:
+                async with asyncio.timeout(SEARCH_ATTEMPT_TIMEOUT_SECONDS):
+                    async with http.stream(
+                        "POST",
+                        TAVILY_ENDPOINT,
+                        headers={
+                            "Authorization": f"Bearer {settings.TAVILY_API_KEY}"
+                        },
+                        json={
+                            "query": safe,
+                            "search_depth": "basic",
+                            "max_results": MAX_RESULTS,
+                        },
+                        timeout=httpx.Timeout(connect=3, read=5, write=3, pool=3),
+                    ) as response:
+                        status_code = response.status_code
+                        if 200 <= status_code < 300:
+                            chunks = bytearray()
+                            async for chunk in response.aiter_bytes():
+                                chunks.extend(chunk)
+                                if len(chunks) > MAX_RESPONSE_BYTES:
+                                    raise TavilyUnavailable(
+                                        "search_response_too_large"
+                                    )
+                            response_body = bytes(chunks)
+            except (TimeoutError, httpx.TimeoutException, httpx.TransportError):
+                # A failed client response does not prove that the paid request
+                # failed server-side. Never repeat it inside this invocation.
+                raise TavilyUnavailable("search_unavailable") from None
             if status_code is None:
                 raise TavilyUnavailable("search_unavailable")
     finally:
         if owned:
             await http.aclose()
-    if status_code == 401 or status_code >= 500:
+    if status_code in {401, 429} or status_code >= 500:
         raise TavilyUnavailable("search_unavailable")
     if not 200 <= status_code < 300:
         raise TavilyUnavailable("search_rejected")
@@ -149,23 +192,14 @@ async def search(
     for item in raw_results[:MAX_RESULTS]:
         if not isinstance(item, dict):
             continue
-        url = item.get("url")
-        parsed = urlsplit(url) if isinstance(url, str) else None
-        if (
-            not parsed
-            or parsed.scheme != "https"
-            or not parsed.netloc
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-        ):
+        url = normalize_source_url(item.get("url"))
+        if url is None:
             continue
         result.append(
             SearchSource(
                 source_id=f"S{len(result) + 1}",
                 title=sanitize_source_title(item.get("title")),
-                url=url[:2_048],
+                url=url,
                 snippet=" ".join(
                     str(item.get("content") or item.get("snippet") or "").split()
                 )[:1_000],
