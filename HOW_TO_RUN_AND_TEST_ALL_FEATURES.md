@@ -337,9 +337,15 @@ Only after health and the scripts pass, register the webhook:
 ```bash
 python scripts/set_webhook.py set
 python scripts/set_webhook.py info
+python scripts/set_qstash_schedule.py set
+python scripts/set_qstash_schedule.py info
 ```
 
-The registered URL must end with `/api/telegram/webhook`, use HTTPS, and show no recent delivery error. The helper configures the secret header, a single connection, and only the update types the application accepts.
+The registered webhook URL must end with `/api/telegram/webhook`, use HTTPS,
+and show no recent delivery error. The helper configures the secret header, a
+single connection, and only the update types the application accepts. The
+QStash schedule must show `*/20 * * * *` and destination
+`/api/cron/banter`.
 
 Do not use `--drop-pending` unless you intentionally want Telegram to discard undelivered messages.
 
@@ -591,8 +597,19 @@ participants' numeric Telegram IDs and add the matching read-only
 used as shard keys. Runtime gathered shards are durable per-user JSON documents
 in Upstash Redis under `memory:gathered<user_id>`, not writable files in the
 Vercel bundle. Set a random
-`CRON_SECRET` in Vercel; Vercel Cron invokes `/api/cron/banter` every 20 minutes
-automatically.
+`CRON_SECRET` in Vercel. Because the Hobby plan cannot run frequent Vercel
+Crons, configure the existing Upstash QStash account to invoke
+`/api/cron/banter` every 20 minutes:
+
+```bash
+python scripts/set_qstash_schedule.py set
+python scripts/set_qstash_schedule.py info
+```
+
+The script forwards `CRON_SECRET` to the protected route. Use
+`python scripts/set_qstash_schedule.py delete` only when intentionally turning
+off scheduled banter. QStash evaluates `*/20 * * * *` in UTC; the application
+still applies its quiet hours in `Europe/Warsaw`.
 
 Manual checks in the allowed group:
 

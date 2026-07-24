@@ -99,7 +99,7 @@ Configure:
   `QSTASH_NEXT_SIGNING_KEY`;
 - `NVIDIA_API_KEY`;
 - `TAVILY_API_KEY` for the explicit `/google` command;
-- `CRON_SECRET` for the authenticated `/api/cron/banter` Vercel Cron route;
+- `CRON_SECRET` for the authenticated `/api/cron/banter` QStash schedule route;
 - `SUPER_ADMIN_ID`, the immutable positive Telegram ID of the owner;
 - `SESSION_SECRET`, at least 32 random bytes;
 - `TELEGRAM_OIDC_CLIENT_ID` and `TELEGRAM_OIDC_CLIENT_SECRET` from BotFather
@@ -118,8 +118,10 @@ files with owner-authored facts before enabling trusted participant memory. Unkn
 Telegram users never receive a trusted static shard automatically. Gathered
 observations are bounded, fallible Redis data and are cleared by `/lobotomy`.
 
-Vercel Cron invokes `/api/cron/banter` every 20 minutes. It is quiet from 01:00
-through 08:59 in `Europe/Warsaw`, and uses only the latest human-authored context.
+Upstash QStash invokes `/api/cron/banter` every 20 minutes. It is quiet from
+01:00 through 08:59 in `Europe/Warsaw`, and uses only the latest human-authored
+context. Configure or inspect the schedule with
+`python scripts/set_qstash_schedule.py set|info|delete` after deployment.
 
 > Do not commit real secrets (`.env` is ignored). If an NVIDIA key was ever
 > committed to an earlier version of `.env.example`, rotate it in NVIDIA NIM.
