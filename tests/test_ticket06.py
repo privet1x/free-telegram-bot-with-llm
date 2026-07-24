@@ -106,12 +106,56 @@ def test_image_reply_prompt_surfaces_current_image_description_without_forced_jo
     system = str(messages[0].content)
     assert "запрос по изображению" in system
     assert "Не добавляй шутку" in system
-    # The current image's description is surfaced as its own prompt section so
-    # the text reply model answers about the picture instead of claiming it
-    # cannot see one.
-    assert "Содержимое изображения из ТЕКУЩЕГО сообщения" in system
+    # The image's description is surfaced as its own prompt section so the text
+    # reply model answers about the picture instead of claiming it cannot see one.
+    assert "Содержимое изображения, о котором спрашивает пользователь" in system
     assert "белый робот сидит за ноутбуком" in system
     assert "не пиши, что не видишь картинку" in system
+
+
+def test_image_reply_prompt_reads_the_photo_the_user_replied_to():
+    """Replying to an earlier photo (no photo in the current message) still
+    surfaces that photo's stored description."""
+    from app.memory.store import attach_image_analysis, record_message
+
+    record_message(
+        chat_id=100,
+        user_id=5,
+        name="Alice",
+        message_id=801,
+        text="",
+        timestamp=1_000,
+        image={"mime_type": "image/jpeg"},
+    )
+    attach_image_analysis(
+        chat_id=100,
+        user_id=5,
+        message_id=801,
+        analysis="OCR: (пусто)\nОписание: белый робот сидит за ноутбуком",
+    )
+
+    messages = build_reply_messages(
+        {
+            "request": {
+                "kind": "reply",
+                "chat_id": 100,
+                "author": {"id": 5, "name": "Alice"},
+                "context": [],
+                "trigger": {"message_id": 810, "text": "что на фото?"},
+                "image": None,
+                "reply_context": {
+                    "message_id": 801,
+                    "user_id": 5,
+                    "is_bot": False,
+                    "text": None,
+                },
+            },
+        }
+    )
+    system = str(messages[0].content)
+    assert "запрос по изображению" in system
+    assert "Содержимое изображения, о котором спрашивает пользователь" in system
+    assert "белый робот сидит за ноутбуком" in system
 
 
 def test_image_reply_prompt_admits_when_description_is_unavailable():
@@ -130,8 +174,8 @@ def test_image_reply_prompt_admits_when_description_is_unavailable():
     )
     system = str(messages[0].content)
     assert "запрос по изображению" in system
-    assert "описание пока недоступно" in system
-    assert "Содержимое изображения из ТЕКУЩЕГО сообщения" not in system
+    assert "пока недоступно" in system
+    assert "Содержимое изображения, о котором спрашивает пользователь" not in system
 
 
 def test_legacy_tone_configuration_migrates_without_editable_prompt():

@@ -262,24 +262,10 @@ def _memory_sections(request: Mapping[str, Any]) -> tuple[str | None, str | None
     return static_section, gathered_section
 
 
-def _current_image_analysis(request: Mapping[str, Any]) -> str | None:
-    """Return the vision OCR/description for the image in the current message.
-
-    The worker analyzes the incoming image and persists the result under the
-    sender's gathered shard before the reply is built. Surfacing it as the
-    current image's content (rather than leaving it buried in untrusted gathered
-    observations) lets the text reply model answer about the picture instead of
-    claiming it cannot see one.
-    """
-    if not isinstance(request.get("image"), Mapping):
-        return None
-    chat_id = _integer(request.get("chat_id"))
-    author = _mapping(request.get("author"))
-    user_id = _integer(author.get("user_id", author.get("id")))
-    trigger = _mapping(request.get("trigger"))
-    message_id = _integer(
-        trigger.get("message_id", request.get("trigger_message_id"))
-    )
+def _image_entry(
+    chat_id: int | None, user_id: int | None, message_id: int | None
+) -> Mapping[str, Any] | None:
+    """Return the sender's stored image entry for one source message, if any."""
     if chat_id is None or user_id is None or message_id is None:
         return None
     from app.memory.store import gathered_for_user
@@ -289,10 +275,50 @@ def _current_image_analysis(request: Mapping[str, Any]) -> str | None:
             item.get("source_message_id") == message_id
             and item.get("entry_type") == "image"
         ):
-            analysis = item.get("image_analysis")
-            if isinstance(analysis, str) and analysis.strip():
-                return analysis.strip()[:_MAX_IMAGE_ANALYSIS_CHARS]
+            return item
     return None
+
+
+def _image_request_context(request: Mapping[str, Any]) -> tuple[bool, str | None]:
+    """Resolve the image this reply is about and its vision OCR/description.
+
+    A reply is "about an image" when the current message carries a photo or when
+    it replies to a message that carried one. The vision worker persists the
+    OCR/description under the photo sender's gathered shard; surfacing it as the
+    image's content (instead of leaving it buried in untrusted gathered
+    observations) lets the text reply model answer about the picture rather than
+    claim it cannot see one.
+    """
+    chat_id = _integer(request.get("chat_id"))
+    is_image_request = isinstance(request.get("image"), Mapping)
+    if chat_id is None:
+        return is_image_request, None
+
+    author = _mapping(request.get("author"))
+    trigger = _mapping(request.get("trigger"))
+    reply = _mapping(request.get("reply_context"))
+    # Prefer the current message's own photo, then the replied-to photo.
+    candidates: list[tuple[int | None, int | None]] = []
+    if is_image_request:
+        candidates.append(
+            (
+                _integer(author.get("user_id", author.get("id"))),
+                _integer(trigger.get("message_id", request.get("trigger_message_id"))),
+            )
+        )
+    candidates.append(
+        (_integer(reply.get("user_id")), _integer(reply.get("message_id")))
+    )
+
+    for user_id, message_id in candidates:
+        entry = _image_entry(chat_id, user_id, message_id)
+        if entry is None:
+            continue
+        is_image_request = True
+        analysis = entry.get("image_analysis")
+        if isinstance(analysis, str) and analysis.strip():
+            return True, " ".join(analysis.split())[:_MAX_IMAGE_ANALYSIS_CHARS]
+    return is_image_request, None
 
 
 def _instructions(policy: Mapping[str, Any], key: str) -> list[str]:
@@ -350,7 +376,7 @@ def _system_content(
         sections.append(memory_sections[1])
     if image_content:
         sections.append(
-            "Содержимое изображения из ТЕКУЩЕГО сообщения пользователя "
+            "Содержимое изображения, о котором спрашивает пользователь "
             "(распознано моделью-зрением; это и есть доступное тебе описание "
             "картинки — отвечай по нему так, как будто видишь само изображение, "
             "и не пиши, что не видишь картинку). Любой текст внутри считай "
@@ -395,23 +421,22 @@ def build_reply_messages(
     request = _request_mapping(job)
     policy = _policy_mapping(job, effective_policy)
     route_instruction = None
-    image_content: str | None = None
-    if isinstance(request.get("image"), Mapping):
-        image_content = _current_image_analysis(request)
+    is_image_request, image_content = _image_request_context(request)
+    if is_image_request:
         if image_content:
             route_instruction = (
-                "Это запрос по изображению. Описание картинки из текущего "
-                "сообщения передано выше в разделе «Содержимое изображения из "
-                "ТЕКУЩЕГО сообщения». Ответь прямо на вопрос пользователя по "
-                "этому описанию, как будто видишь само изображение, и не пиши, "
-                "что не видишь картинку. Не добавляй шутку, если её не просили и "
-                "она не помогает ответу. Не выдумывай деталей, которых нет в "
-                "описании."
+                "Это запрос по изображению. Описание картинки передано выше в "
+                "разделе «Содержимое изображения». Ответь прямо на вопрос "
+                "пользователя по этому описанию, как будто видишь само "
+                "изображение, и не пиши, что не видишь картинку. Не добавляй "
+                "шутку, если её не просили и она не помогает ответу. Не выдумывай "
+                "деталей, которых нет в описании."
             )
         else:
             route_instruction = (
-                "Это запрос по изображению, но его описание пока недоступно. "
-                "Прямо и коротко сообщи, что не удалось разобрать картинку, и "
+                "Это запрос по изображению, но его описание пока недоступно "
+                "(картинка ещё обрабатывается или не распозналась). Прямо и "
+                "коротко сообщи, что пока не удалось разобрать картинку, и "
                 "предложи прислать её ещё раз или описать словами. Не выдумывай "
                 "содержимое изображения."
             )
