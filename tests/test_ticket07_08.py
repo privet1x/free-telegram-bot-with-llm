@@ -30,6 +30,47 @@ def test_gathered_memory_is_bounded_and_lobotomy_owner_bypasses_cooldown(monkeyp
     assert lobotomy(100, 5) == ("reset", 0)
 
 
+def test_always_include_participant_facts_load_without_being_in_the_window():
+    from app.llm.prompts import build_reply_messages
+
+    # Roman (169836665) is flagged always_include in the manifest.
+    assert 169836665 in memory_store.always_static_user_ids()
+
+    # A message authored by a different user, with Roman absent from context.
+    request = {
+        "kind": "reply",
+        "chat_id": 100,
+        "author": {"id": 462421705, "name": "Anton"},
+        "context": [],
+        "trigger": {"message_id": 55, "text": "кто такой Роман по работе?"},
+    }
+    system = str(build_reply_messages({"request": request}, {})[0].content)
+    assert '"user_id":169836665' in system
+    assert "бадрулька" in system
+
+
+def test_manifest_rejects_non_boolean_always_include(tmp_path, monkeypatch):
+    manifest = tmp_path / "manifest.json"
+    shards = tmp_path / "shards"
+    shards.mkdir()
+    manifest.write_text(
+        json.dumps(
+            {"participants": [{"user_id": 1, "slug": "user1", "always_include": "yes"}]}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(memory_store, "_MANIFEST_PATH", manifest)
+    monkeypatch.setattr(memory_store, "_SHARDS_PATH", shards)
+    monkeypatch.setattr(memory_store, "_static_cache", None)
+    monkeypatch.setattr(memory_store, "_always_static_cache", None)
+    try:
+        memory_store.static_shards()
+    except RuntimeError as exc:
+        assert "manifest" in str(exc)
+    else:
+        raise AssertionError("non-boolean always_include was accepted")
+
+
 def test_static_manifest_rejects_duplicate_ids_and_missing_shards(tmp_path, monkeypatch):
     manifest = tmp_path / "manifest.json"
     shards = tmp_path / "shards"

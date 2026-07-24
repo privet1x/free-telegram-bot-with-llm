@@ -10,7 +10,8 @@
     },
     {
       "user_id": 169836665,
-      "slug": "roman"
+      "slug": "roman",
+      "always_include": true
     },
     {
       "user_id": 301206870,

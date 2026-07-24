@@ -208,10 +208,17 @@ def _memory_sections(request: Mapping[str, Any]) -> tuple[str | None, str | None
     chat_id = _integer(request.get("chat_id"))
     if chat_id is None:
         return None, None
-    from app.memory.store import gathered_for_users, static_for_users
+    from app.memory.store import (
+        always_static_user_ids,
+        gathered_for_users,
+        static_for_users,
+    )
 
     user_ids = _request_user_ids(request)
-    static = static_for_users(user_ids)
+    # Some participants keep their stable facts loaded on every reply, even when
+    # they are absent from the current window, so the bot always has their
+    # context (e.g. running jokes) available.
+    static = static_for_users(user_ids | set(always_static_user_ids()))
     gathered = gathered_for_users(chat_id, user_ids)
     static_section: str | None = None
     gathered_section: str | None = None

@@ -36,6 +36,7 @@ _SHARDS_PATH = Path(__file__).with_name("shards")
 _SLUG_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 _cache_lock = threading.RLock()
 _static_cache: dict[int, str] | None = None
+_always_static_cache: frozenset[int] | None = None
 _gather_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="memory")
 _gather_slots = threading.BoundedSemaphore(32)
 
@@ -56,25 +57,30 @@ def _decode_manifest() -> list[dict[str, Any]]:
             raise RuntimeError("memory manifest entry is invalid")
         user_id = item.get("user_id")
         slug = item.get("slug")
+        always_include = item.get("always_include", False)
         if (
             isinstance(user_id, bool)
             or not isinstance(user_id, int)
             or user_id <= 0
             or not isinstance(slug, str)
             or _SLUG_RE.fullmatch(slug) is None
+            or not isinstance(always_include, bool)
             or user_id in ids
             or slug in slugs
         ):
             raise RuntimeError("memory manifest entry is invalid")
         ids.add(user_id)
         slugs.add(slug)
-        result.append({"user_id": user_id, "slug": slug})
+        result.append(
+            {"user_id": user_id, "slug": slug, "always_include": always_include}
+        )
     return result
 
 
-def _load_static() -> dict[int, str]:
+def _load_static() -> tuple[dict[int, str], frozenset[int]]:
     manifest = _decode_manifest()
     loaded: dict[int, str] = {}
+    always: set[int] = set()
     total = 0
     for item in manifest:
         path = _SHARDS_PATH / f"memory-shard-{item['slug']}.md"
@@ -88,24 +94,44 @@ def _load_static() -> dict[int, str]:
         if total > MAX_TOTAL_STATIC_CHARS:
             raise RuntimeError("configured static memory is too large")
         loaded[item["user_id"]] = content
-    return loaded
+        if item["always_include"]:
+            always.add(item["user_id"])
+    return loaded, frozenset(always)
+
+
+def _ensure_static_cache() -> None:
+    global _static_cache, _always_static_cache
+    with _cache_lock:
+        if _static_cache is None or _always_static_cache is None:
+            _static_cache, _always_static_cache = _load_static()
 
 
 def static_shards() -> dict[int, str]:
     """Return a cached copy of immutable static memory."""
-    global _static_cache
+    _ensure_static_cache()
     with _cache_lock:
-        if _static_cache is None:
-            _static_cache = _load_static()
-        return dict(_static_cache)
+        return dict(_static_cache or {})
+
+
+def always_static_user_ids() -> frozenset[int]:
+    """Return IDs whose immutable facts load into every reply in their chat.
+
+    Participants flagged ``always_include`` in the manifest stay in the prompt
+    even when they are not part of the current conversation window, so the bot
+    keeps their stable context (nicknames, running jokes) available on demand.
+    """
+    _ensure_static_cache()
+    with _cache_lock:
+        return _always_static_cache or frozenset()
 
 
 def reload_static_shards() -> dict[int, str]:
     """Reload checked-in files after a deployment or explicit cache reset."""
-    global _static_cache
-    loaded = _load_static()
+    global _static_cache, _always_static_cache
+    loaded, always = _load_static()
     with _cache_lock:
         _static_cache = loaded
+        _always_static_cache = always
         return dict(loaded)
 
 

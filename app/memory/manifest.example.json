@@ -2,7 +2,8 @@
   "participants": [
     {
       "user_id": 111111111,
-      "slug": "user1"
+      "slug": "user1",
+      "always_include": true
     },
     {
       "user_id": 222222222,
