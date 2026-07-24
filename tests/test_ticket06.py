@@ -71,11 +71,30 @@ def test_immutable_super_context_excludes_runtime_identity_and_admin_policy():
     assert data["author"]["name"] == "UNTRUSTED_FIRST_NAME"
 
 
-def test_image_reply_prompt_requests_direct_description_without_forced_jokes():
+def test_image_reply_prompt_surfaces_current_image_description_without_forced_jokes():
+    from app.memory.store import attach_image_analysis, record_message
+
+    record_message(
+        chat_id=100,
+        user_id=5,
+        name="Alice",
+        message_id=10,
+        text="что на фото?",
+        timestamp=1_000,
+        image={"mime_type": "image/jpeg"},
+    )
+    attach_image_analysis(
+        chat_id=100,
+        user_id=5,
+        message_id=10,
+        analysis="OCR: (пусто)\nОписание: белый робот сидит за ноутбуком",
+    )
+
     messages = build_reply_messages(
         {
             "request": {
                 "kind": "reply",
+                "chat_id": 100,
                 "author": {"id": 5, "name": "Alice"},
                 "context": [],
                 "trigger": {"message_id": 10, "text": "что на фото?"},
@@ -87,6 +106,32 @@ def test_image_reply_prompt_requests_direct_description_without_forced_jokes():
     system = str(messages[0].content)
     assert "запрос по изображению" in system
     assert "Не добавляй шутку" in system
+    # The current image's description is surfaced as its own prompt section so
+    # the text reply model answers about the picture instead of claiming it
+    # cannot see one.
+    assert "Содержимое изображения из ТЕКУЩЕГО сообщения" in system
+    assert "белый робот сидит за ноутбуком" in system
+    assert "не пиши, что не видишь картинку" in system
+
+
+def test_image_reply_prompt_admits_when_description_is_unavailable():
+    messages = build_reply_messages(
+        {
+            "request": {
+                "kind": "reply",
+                "chat_id": 100,
+                "author": {"id": 5, "name": "Alice"},
+                "context": [],
+                "trigger": {"message_id": 10, "text": "что на фото?"},
+                "image": {"file_id": "photo"},
+            },
+            "effective_policy": {"tone_preset": "sarcastic_bot"},
+        }
+    )
+    system = str(messages[0].content)
+    assert "запрос по изображению" in system
+    assert "описание пока недоступно" in system
+    assert "Содержимое изображения из ТЕКУЩЕГО сообщения" not in system
 
 
 def test_legacy_tone_configuration_migrates_without_editable_prompt():
